@@ -1,0 +1,9 @@
+# dsh-mcp-bridge: MCP server for Claude Code + bottom-right toolbar.
+# Volatile fields (enabled, mode, models, defaultWorkspace, autoApprove) are
+# edited live from the toolbar and stored in the profile's own cordis.patch.yml.
+- insert:
+    - id: mcp-bridge
+      name: dsh-mcp-bridge
+      config:
+        host: 127.0.0.1
+        port: 8090
