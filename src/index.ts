@@ -16,11 +16,12 @@ import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
 import tls from 'node:tls'
+import { createPipeIdentity, PIPE_PROTOCOL } from '../bin/pipe-tls.mjs'
 import { homedir, userInfo } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -1107,7 +1108,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   function buildServer(): McpServer {
-    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.0' })
+    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.1' })
     server.tool('harness_status', '查看 Harness MCP 桥接状态：开关、模式、锁定模型/供应商、默认工作区、自动批准', {}, async () => {
       try { return text(await status()) } catch (error) { return failure(String(error)) }
     })
@@ -1190,42 +1191,42 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   const endpointFile = join(dshHome(), 'mcp-bridge', 'endpoint.json')
-  const endpoint: { pipe?: string; protocol: string; http?: string; pid: number } = { pid: process.pid, protocol: 'tls-psk-v2' }
+  const endpoint: { pipe?: string; protocol: string; http?: string; pid: number } = { pid: process.pid, protocol: PIPE_PROTOCOL }
   const publishEndpoint = async () => {
     await mkdir(join(dshHome(), 'mcp-bridge'), { recursive: true })
     await writeFile(`${endpointFile}.tmp`, JSON.stringify(endpoint, null, 2))
     await rename(`${endpointFile}.tmp`, endpointFile)
   }
 
-  // Standard PSK-only TLS over the local pipe authenticates BOTH peers and
-  // encrypts MCP frames. No certificate fallback and no plaintext-token downgrade.
+  // Standard TLS 1.3 with mutually pinned signing keys works in Electron's
+  // BoringSSL too. Both pins derive from the token, which is never transmitted.
   ctx.effect(() => {
     const path = config.pipePath || defaultPipePath()
     const sockets = new Set<net.Socket>()
-    let key: Buffer
-    const server = tls.createServer({
-      minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', ciphers: 'PSK-AES256-GCM-SHA384', handshakeTimeout: 10_000,
-      pskCallback: (_socket, identity) => identity === 'dsh-mcp-bridge-v2' ? key : null,
-    }, socket => {
-      socket.pause()
-      const mcp = buildServer()
-      socket.on('error', () => socket.destroy())
-      socket.on('close', () => { void mcp.close() })
-      void mcp.connect(new StdioServerTransport(socket, socket)).then(() => socket.resume()).catch(() => socket.destroy())
-    })
-    server.on('connection', raw => {
-      sockets.add(raw)
-      raw.on('close', () => sockets.delete(raw))
-      raw.on('error', () => raw.destroy())
-    })
-    server.on('tlsClientError', (_error, socket) => socket.destroy())
-    server.on('error', (error: NodeJS.ErrnoException) => {
-      logger.error(error.code === 'EADDRINUSE'
-        ? `管道 ${path} 已被占用（是否有另一个 Harness 实例在运行？）`
-        : `pipe server error: ${String(error)}`)
-    })
+    let server: tls.Server | undefined
+    let disposed = false
     const listen = async () => {
-      key = createHash('sha256').update(await tokenReady).digest()
+      const identity = createPipeIdentity(await tokenReady, 'server')
+      if (disposed) return
+      server = tls.createServer({ ...identity.options, handshakeTimeout: 10_000 }, socket => {
+        socket.on('error', () => socket.destroy())
+        if (!identity.verifyPeer(socket)) { socket.destroy(); return }
+        socket.pause()
+        const mcp = buildServer()
+        socket.on('close', () => { void mcp.close() })
+        void mcp.connect(new StdioServerTransport(socket, socket)).then(() => socket.resume()).catch(() => socket.destroy())
+      })
+      server.on('connection', raw => {
+        sockets.add(raw)
+        raw.on('close', () => sockets.delete(raw))
+        raw.on('error', () => raw.destroy())
+      })
+      server.on('tlsClientError', (_error, socket) => socket.destroy())
+      server.on('error', (error: NodeJS.ErrnoException) => {
+        logger.error(error.code === 'EADDRINUSE'
+          ? `管道 ${path} 已被占用（是否有另一个 Harness 实例在运行？）`
+          : `pipe server error: ${String(error)}`)
+      })
       if (process.platform !== 'win32') {
         await mkdir(join(path, '..'), { recursive: true })
         // A stale socket file from a crash would block listen(); a live owner still answers connect().
@@ -1239,6 +1240,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         }
         await rm(path, { force: true })
       }
+      if (disposed) return
       server.listen(path, () => {
         logger.info(`MCP pipe listening on ${path}`)
         endpoint.pipe = path
@@ -1247,8 +1249,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
     void listen().catch(() => logger.error('PIPE_START_FAILED'))
     return () => {
+      disposed = true
       for (const socket of sockets) socket.destroy()
-      server.close()
+      server?.close(() => undefined)
     }
   }, 'mcp-bridge: pipe server')
 

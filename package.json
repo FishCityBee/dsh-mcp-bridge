@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-bridge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Drive DeepSeek Harness desktop agents from Claude Code (or any MCP client) over a local pipe, with an in-app toolbar for model, provider, workspace and session cleanup.",
   "private": true,
   "type": "module",

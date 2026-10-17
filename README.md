@@ -39,7 +39,7 @@
 
 ## 安装
 
-需要：DeepSeek Harness 桌面端 **0.2.1-rc.2**、带 OpenSSL PSK 支持的 Node.js 22+。本次修复版本为 **0.2.0**，未验证其他 Harness 版本。
+需要：DeepSeek Harness 桌面端 **0.2.1-rc.2**、Node.js 22+。本次修复版本为 **0.2.1**，未验证其他 Harness 版本。0.2.1 修复了 0.2.0 的 OpenSSL PSK 密码套件在桌面 Electron / BoringSSL 中不可用的问题。
 
 ```bash
 git clone https://github.com/FishCityBee/dsh-mcp-bridge.git
@@ -64,7 +64,7 @@ npm run build          # 产出 dist-package/
 claude mcp add-json dsh-harness -s user '{"type":"stdio","command":"node","args":["C:/path/to/dsh-mcp-bridge/dist-package/bin/stdio.mjs"],"timeout":86400000}'
 ```
 
-- `bin/stdio.mjs` 使用 Node 内置 TLS PSK 完成双向认证和加密，再转发 MCP。长期 token 只作为密钥输入，不在管道上发送。必须同时更新插件和中转脚本；旧明文握手不降级兼容。
+- `bin/stdio.mjs` 使用标准 TLS 1.3 加密。双方分别从本地 token 派生独立的 P-256 签名密钥，并核对对端公钥；客户端验证服务端后才转发 MCP，服务端验证客户端后才接纳 MCP。自签证书只作 TLS 容器，信任依据是派生的公钥锁定；长期 token 与私钥均不在管道上发送。无需外部 OpenSSL 或证书文件。必须同时更新插件和中转脚本，协议为 `tls-pinned-v3`；旧明文及 PSK 握手不降级兼容。
 - `timeout` 设成 24 小时，它同时也是 Claude Code 空闲超时的下限，保证长任务不会被 stdio 默认 30 分钟的空闲超时打断。
 - Harness 重启后，中转脚本会随连接断开而退出，需要在 Claude Code 里用 `/mcp` 重连。
 

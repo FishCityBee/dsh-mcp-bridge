@@ -5,7 +5,7 @@
 // Env overrides: DSH_HOME, DSH_MCP_BRIDGE_PIPE, DSH_MCP_BRIDGE_TOKEN, DSH_MCP_BRIDGE_WAIT_MS.
 import net from 'node:net'
 import tls from 'node:tls'
-import { createHash } from 'node:crypto'
+import { createPipeIdentity } from './pipe-tls.mjs'
 import { readFileSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
@@ -61,17 +61,17 @@ try {
   fail(`连不上 DeepSeek Harness（${path}）：${error.code ?? error.message}。请确认 Harness 桌面端已启动且 dsh-mcp-bridge 插件已加载。`)
 }
 
-// A PSK-only cipher cannot fall back to an unauthenticated certificate.
-// The long-term token is a key input only; it is never put on the wire.
+// Verify the token-derived server pin before forwarding any MCP bytes. Client
+// and server signing keys are distinct; TLS proves possession of each key.
 const raw = socket
+const identity = createPipeIdentity(secret, 'client')
 socket = tls.connect({
-  socket: raw, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2',
-  ciphers: 'PSK-AES256-GCM-SHA384', rejectUnauthorized: false,
-  pskCallback: () => ({ identity: 'dsh-mcp-bridge-v2', psk: createHash('sha256').update(secret).digest() }),
+  ...identity.options, socket: raw,
 })
 let secure = false
 const handshakeTimeout = setTimeout(() => fail('管道身份认证超时；请同时更新插件与中转脚本'), 10_000)
 socket.once('secureConnect', () => {
+  if (!identity.verifyPeer(socket)) return fail('PIPE_SERVER_AUTH_FAILED: 请同时更新插件和中转脚本')
   secure = true
   clearTimeout(handshakeTimeout)
   socket.pipe(process.stdout)
