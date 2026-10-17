@@ -15,6 +15,7 @@ import { IconTrashOutlineRegular, MenuItemButton } from '@deepseek-ai/dsh-client
 import { useEffect, useRef, useState } from 'react'
 import { STYLE } from './style.ts'
 import { CleanupSection, type BatchAction, type BatchFilter } from './cleanup.tsx'
+import { SettingsSync } from './settings-sync.ts'
 
 const NS = 'mcp-bridge'
 const COMMAND_TIMEOUT_MS = 60_000
@@ -33,8 +34,10 @@ interface Settings {
   providerId: string
   providerDefaultModel: string
   providerDefaultEffort: string
+  providerAllowOverrides: boolean
   defaultWorkspace: string
   autoApprove: boolean
+  approvalMode: 'inherit' | 'ask' | 'never'
   autoCleanupDays: number
   command: string
   commandResult: string
@@ -59,6 +62,7 @@ interface Command {
   manageAction?: BatchAction
   filter?: BatchFilter
   confirm?: boolean
+  previewToken?: string
 }
 type SendCommand = (command: Command) => Promise<any>
 
@@ -121,35 +125,24 @@ export function apply(ctx: Context): void {
       store.update({ error: `模型列表加载失败：${message(error)}` })
     }
   }
-  const loadSettings = async () => {
-    try {
+  const sync = new SettingsSync<Settings>({
+    async read() {
       const described = unwrap<{ namespaces: { ns: string; value: Settings }[] }>(await c.remote.settings.describe())
       const view = described.namespaces.find(n => n.ns === NS)
-      if (!view) {
-        store.update({ error: 'Harness 未加载 mcp-bridge 插件配置' })
-        return
-      }
-      store.update({ settings: view.value, error: null })
+      if (!view) throw new Error('Harness 未加载 mcp-bridge 插件配置')
       settleCommands(view.value)
-    } catch (error) {
-      store.update({ error: `读取配置失败：${message(error)}` })
-    }
-  }
-  const save = async (patch: Partial<Editable>) => {
-    const previous = store.getSnapshot().settings
-    if (previous) store.update({ settings: { ...previous, ...patch } })
-    store.update({ saving: true })
-    try {
+      return view.value
+    },
+    async write(patch) {
       const view = unwrap<{ value: Settings }>(await c.remote.settings.update(NS, patch, undefined))
-      store.update({ settings: view.value, error: null })
-    } catch (error) {
-      if (previous) store.update({ settings: previous })
-      store.update({ error: `保存失败：${message(error)}` })
-    } finally {
-      store.update({ saving: false })
-    }
-  }
-  const sendCommand: SendCommand = (command) => {
+      settleCommands(view.value)
+      return view.value
+    },
+    publish(settings, saving, error) { store.update({ ...(settings ? { settings } : {}), saving, error }) },
+  })
+  const loadSettings = () => sync.load()
+  const save = (patch: Partial<Editable>) => sync.save(patch)
+  const performCommand: SendCommand = (command) => {
     const id = `cmd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -169,6 +162,13 @@ export function apply(ctx: Context): void {
         reject(new Error(`发送失败：${message(error)}`))
       })
     })
+  }
+
+  let commandQueue: Promise<unknown> = Promise.resolve()
+  const sendCommand: SendCommand = command => {
+    const result = commandQueue.then(() => performCommand(command))
+    commandQueue = result.catch(() => undefined)
+    return result
   }
 
   void loadCatalog()
@@ -363,7 +363,12 @@ function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: Toolba
                   </select>
                 </label>
               )}
-              <p className="dmb-note">调用方可在该供应商内自选模型与推理等级；未指定时用上面的默认值</p>
+              <label className="dmb-check">
+                <input type="checkbox" checked={settings?.providerAllowOverrides ?? false} disabled={!settings}
+                  onChange={e => void save({ providerAllowOverrides: e.target.checked })} />
+                <span>允许调用方选择模型/推理等级</span>
+              </label>
+              <p className="dmb-note">默认关闭：上面的模型和等级成为任务约束。开启后允许在此供应商范围内明确选择。</p>
             </>
           )}
 
@@ -376,11 +381,17 @@ function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: Toolba
             </select>
           </label>
 
-          <label className="dmb-check" title="开启后 MCP 新建的会话不再询问审批，直接执行命令和写文件">
-            <input type="checkbox" checked={settings?.autoApprove ?? false} disabled={!settings}
-              onChange={e => void save({ autoApprove: e.target.checked })} />
-            <span>MCP 任务自动批准</span>
+          <label className="dmb-field">
+            <span>MCP 会话审批</span>
+            <select value={settings?.approvalMode ?? 'inherit'} disabled={!settings}
+              onChange={e => void save({ approvalMode: e.target.value as Settings['approvalMode'] })}>
+              <option value="inherit">沿用会话 / Harness 设置</option>
+              <option value="ask">需要审批时询问</option>
+              <option value="never">需要审批时自动拒绝</option>
+            </select>
           </label>
+          <p className="dmb-note">该版只支持单次允许；允许调用 MCP 不会授予下游文件或命令权限。沙箱与权限范围沿用会话设置。</p>
+          {settings?.autoApprove && <p className="dmb-note">旧“自动批准”设置已停用：它原来实际是拒绝审批。已有会话保留原权限，可明确选择“需要审批时询问”。</p>}
 
           <CleanupSection autoCleanupDays={settings?.autoCleanupDays} cleanupStatus={settings?.cleanupStatus} defaultWorkspace={settings?.defaultWorkspace}
             workspaces={workspaces} saveDays={settings ? days => void save({ autoCleanupDays: days }) : undefined} sendCommand={sendCommand} />

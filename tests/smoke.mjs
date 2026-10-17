@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { ApprovalService } from '@deepseek-ai/dsh-user-approval'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 const home = await mkdtemp(join(tmpdir(), 'dmb-home-'))
@@ -24,7 +25,7 @@ const sleep = ms => new Promise(res => setTimeout(res, ms))
 const values = {
   enabled: true, mode: 'single', singleProvider: 'opencode', singleModel: 'flash', singleEffort: 'high',
   providerId: 'opencode', providerDefaultModel: 'flash', providerDefaultEffort: '', defaultWorkspace: 'ws-1', autoApprove: false,
-  autoCleanupDays: 0, command: '', commandResult: '', cleanupStatus: '',
+  providerAllowOverrides: false, approvalMode: 'inherit', autoCleanupDays: 0, command: '', commandResult: '', cleanupStatus: '',
 }
 const config = {
   pipePath: pipe, httpEnabled: false, host: '127.0.0.1', port: 0, authTokenFile: '', preset: '', maxConcurrentTasks: 2,
@@ -50,36 +51,62 @@ function runExclusive(operation) {
 }
 const cancelled = []
 
-/** Fake agent: "slow:<ms>" tasks take that long; "approve" tasks log an approval question. */
+// Faithful offline seams: persisted request headers, actual official approval
+// decisions, cancellation, and turn/end are independent from whenIdle.
+const knownSessions = new Map()
+const approval = Object.create(ApprovalService.prototype)
+Object.defineProperty(approval, 'ctx', { value: { waterfall(_target, _name, req) {
+  return new Promise(resolve => setTimeout(() => resolve('allowed-once'), req.fixtureDelay ?? 100))
+} } })
+approval.config = { policy: 'ask' }
+const waterfall = (table, name, payload, terminal) => {
+  const list = table[name] ?? []
+  const run = i => list[i] ? (name === 'system-prompt/assemble' ? list[i](payload, {}, () => run(i + 1)) : list[i](payload, () => run(i + 1))) : terminal()
+  return run(0)
+}
 function fakeAgent(sessionId, cwd, options) {
-  const messages = []
-  const events = []
-  let idle = Promise.resolve()
+  const messages = [], events = [], hooks = {}
+  let idle = Promise.resolve(), controller = new AbortController(), turn = 0
   const agent = {
-    id: sessionId,
+    id: sessionId, status: 'idle',
+    ctx: { on(name, fn, opts) { const list = hooks[name] ??= []; opts?.prepend ? list.unshift(fn) : list.push(fn); return () => { const i = list.indexOf(fn); if (i >= 0) list.splice(i, 1) } } },
     session: {
-      header: { id: sessionId, cwd },
-      deriveMessages: () => [...messages],
-      snapshotEvents: from => events.slice(from),
-      get seq() { return events.length },
+      header: { id: sessionId, cwd }, deriveMessages: () => [...messages], snapshotEvents: (from = 0) => events.slice(from),
+      get seq() { return events.length }, eventAt: seq => events[seq],
+      append(type, data) { const event = { type, seq: events.length, data }; events.push(event); return event },
+      requestHeader: () => events.findLast(e => e.type === 'request/header')?.data.header,
     },
+    inject(message) { messages.push(message) },
     followup(message) {
+      controller = new AbortController(); agent.status = 'running'; const t = ++turn
       messages.push(message)
-      const text = message.content[0].text
-      const delay = Number(/slow:(\d+)/.exec(text)?.[1] ?? 0)
-      if (text.includes('approve')) events.push({ type: 'approval/asked', seq: events.length, data: { id: 'a1', toolName: 'bash' } })
-      idle = new Promise(res => setTimeout(() => {
-        if (text.includes('approve')) events.push({ type: 'approval/decided', seq: events.length, data: { id: 'a1', outcome: 'allow' } })
-        messages.push({ role: 'assistant', content: [
-          { type: 'tool-call', name: 'bash', arguments: '{"cmd":"ls"}' },
-          { type: 'text', text: `done: ${text} via ${options.agentOptions.model}/${options.agentOptions.reasoningEffort}` },
-        ] })
-        res()
-      }, delay))
+      const text = message.content[0].text, delay = Number(/slow:(\d+)/.exec(text)?.[1] ?? 0)
+      agent.session.append('turn/start', { turn: t })
+      agent.session.append('agent/inbox/spliced', { removedCount: 1, inserted: [] })
+      idle = (async () => {
+        let reason = { kind: 'completed' }
+        try {
+          await waterfall(hooks, 'system-prompt/assemble', {}, () => Promise.resolve({ variables: {} }))
+          const route = await waterfall(hooks, 'agent/request', { agent }, () => Promise.resolve(agent.session.requestHeader()?.config ?? options.agentOptions))
+          agent.session.append('step/start', { turn: t, step: 1 })
+          agent.session.append('request/header', { header: { config: route }, reason: 'change' })
+          const stream = waterfall(listeners, 'llm/stream', { ...route, sessionId, signal: controller.signal }, () => (async function* () { yield {} })())
+          for await (const _chunk of stream) {}
+          if (text.includes('approve')) await approval.request({ agent, toolName: 'bash', signal: controller.signal, fixtureDelay: delay })
+          else if (delay) await Promise.race([sleep(delay), new Promise(resolve => controller.signal.addEventListener('abort', resolve, { once: true }))])
+          if (controller.signal.aborted) reason = { kind: 'aborted', reason: controller.signal.reason }
+          else messages.push({ role: 'assistant', content: [
+            { type: 'tool-call', name: 'bash', arguments: '{"cmd":"ls"}' },
+            { type: 'text', text: `done: ${text} via ${route.model}/${route.reasoningEffort}` },
+          ] })
+        } catch (e) { reason = { kind: 'error', error: { code: 'FIXTURE', message: e.message } } }
+        agent.session.append('turn/end', { turn: t, reason }); agent.status = 'idle'
+      })()
     },
     whenIdle: () => idle,
-    cancel() { cancelled.push(sessionId) },
+    cancel(cause) { if (cause?.kind === 'user') cancelled.push(sessionId); controller.abort(cause) },
   }
+  knownSessions.set(sessionId, agent)
   return agent
 }
 
@@ -88,6 +115,8 @@ const ctx = {
   effect(fn) { const d = fn(); if (typeof d === 'function') disposers.push(d) },
   get(name) { return this[name] },
   hmr,
+  approval,
+  sessionPersistence: { root: join(home, 'sessions'), async stat(id) { const agent = knownSessions.get(id) ?? ctx.agents.live.get(id); return agent || workspace.sessionIds.includes(id) ? { header: { id, cwd: workdir }, revision: String(agent?.session?.seq ?? 0) } : undefined } },
   on(name, fn) { (listeners[name] ??= []).push(fn) },
   settings: {
     update(ns, patch) {
@@ -110,8 +139,9 @@ const ctx = {
     get(id) { return this.live.get(String(id)) },
     async create(options) {
       const agent = fakeAgent(options.sessionId, options.meta.cwd, options)
-      await options.setup?.({}, agent)
-      return { agent, dispose: async () => {} }
+      await options.setup?.(agent.ctx, agent)
+      this.live.set(options.sessionId, agent)
+      return { agent, dispose: async () => { agent.cancel({ kind: 'disposed' }); await agent.whenIdle(); this.live.delete(options.sessionId) } }
     },
   },
   workspaceRegistry: {
@@ -189,6 +219,7 @@ r = await call('run_task', { task: 'p', workspace: 'nope' })
 check('unknown workspace name rejected', r.isError && String(r.body).includes('找不到工作区'), r)
 
 values.mode = 'provider'
+values.providerAllowOverrides = true // Explicit opt-in preserves this existing override smoke case.
 r = await call('list_models')
 check('provider mode lists provider models', r.body.models.length === 2 && !r.body.locked, r)
 values.providerDefaultEffort = 'high'
@@ -241,10 +272,11 @@ check('delete_session removes files permanently',
 const residentId = 'session-resident'
 workspace.sessionIds.push(residentId)
 const residentDir = await sessionDir(residentId)
-ctx.agents.live.set(residentId, { whenIdle: async () => {} })
+ctx.agents.live.set(residentId, { session: { header: { id: residentId, cwd: workdir } }, whenIdle: async () => {} })
 r = await call('delete_session', { sessionId: residentId, confirm: true })
-check('resident session: archived to stop it, detached, files removed',
-  !r.isError && archived.includes(residentId) && !workspace.sessionIds.includes(residentId) && !(await exists(residentDir)), r)
+// Another owner may retain a writer after idle: queue instead of deleting under it.
+check('resident session: stopped, detached, files safely queued for owner release',
+  !r.isError && archived.includes(residentId) && !workspace.sessionIds.includes(residentId) && await exists(residentDir) && !!r.body.note, r)
 ctx.agents.live.delete(residentId)
 
 // ---- toolbar mailbox (also without volatile-update events: host polls) ------------
@@ -276,7 +308,10 @@ check('mailbox batch archive executes', reply.ok && reply.result.done >= 1, repl
 const oldId = workspace.sessionIds[0]
 const oldDir = await sessionDir(oldId)
 const longAgo = new Date(Date.now() - 10 * 86_400_000)
+// Directory age is not activity; the current log must actually be old.
+await utimes(join(oldDir, 'session.v4.jsonl.zstd'), longAgo, longAgo)
 await utimes(oldDir, longAgo, longAgo)
+ctx.agents.live.delete(oldId)
 const freshId = workspace.sessionIds[1]
 await sessionDir(freshId)
 await ctx.settings.update('mcp-bridge', { autoCleanupDays: 7 })

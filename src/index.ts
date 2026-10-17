@@ -10,25 +10,31 @@
 import type { Context } from '@deepseek-ai/cordis'
 import Schema from '@deepseek-ai/schemastery'
 import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { foldConsumedWork, installModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { mkdir, readFile, readdir, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import net from 'node:net'
+import tls from 'node:tls'
 import { homedir, userInfo } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { buildCatalog, findModel, type Catalog } from './catalog.ts'
 import { SessionLedger } from './ledger.ts'
 import { createFileLogger, type BridgeLogger } from './log.ts'
 import { ACTIVE, TaskStore, type StoredTask, type TaskProgress } from './tasks.ts'
+import { configVersion, sameSelection, select, type Selection, type SelectionSettings } from './selection.ts'
+import { Semaphore } from './scheduler.ts'
+import { SessionFiles, validateSessionId } from './session-files.ts'
+import { JsonWriter, readJson } from './persistence.ts'
 
 export const name = 'mcp-bridge'
-export const inject = ['llm', 'agents', 'agentPresets', 'workspaceRegistry']
+export const inject = ['llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence']
 
 type Mode = 'single' | 'provider'
 
@@ -48,8 +54,10 @@ export const Config = Schema.object({
   providerId: Schema.string().default('').volatile(),
   providerDefaultModel: Schema.string().default('').volatile(),
   providerDefaultEffort: Schema.string().default('').volatile(),
+  providerAllowOverrides: Schema.boolean().default(false).volatile(),
   defaultWorkspace: Schema.string().default('').volatile(),
   autoApprove: Schema.boolean().default(false).volatile(),
+  approvalMode: Schema.union(['inherit', 'ask', 'never'] as const).default('inherit').volatile(),
   autoCleanupDays: Schema.number().default(0).volatile(),
   // Toolbar → host mailbox (JSON strings); see handleCommand.
   command: Schema.string().default('').volatile(),
@@ -74,15 +82,15 @@ interface BridgeConfig {
   providerId: Ref<string>
   providerDefaultModel: Ref<string>
   providerDefaultEffort: Ref<string>
+  providerAllowOverrides?: Ref<boolean>
   defaultWorkspace: Ref<string>
   autoApprove: Ref<boolean>
+  approvalMode?: Ref<'inherit' | 'ask' | 'never'>
   autoCleanupDays: Ref<number>
   command: Ref<string>
   commandResult: Ref<string>
   cleanupStatus: Ref<string>
 }
-
-interface Selection { provider: string; model: string; reasoningEffort?: string }
 
 interface WorkspaceLike {
   readonly id: string
@@ -97,6 +105,7 @@ interface TaskArgs {
   task: string
   workspace?: string
   sessionId?: string
+  provider?: string
   model?: string
   reasoningEffort?: string
   title?: string
@@ -105,7 +114,10 @@ interface TaskArgs {
 /** In-memory companion of a stored task: completion promise and cancel hook. */
 interface TaskRuntime {
   done: Promise<void>
+  controller: AbortController
+  sessionId?: string
   cancel?: () => void
+  detach?: () => void
 }
 
 /** How often a waiting MCP call emits a progress notification (keeps Claude Code's idle timer alive). */
@@ -127,8 +139,6 @@ function defaultPipePath(): string {
   return join(dshHome(), 'mcp-bridge', 'bridge.sock')
 }
 
-/** First line a pipe client must send before MCP framing starts. */
-const AUTH_KEY = 'dsh-mcp-bridge-auth'
 
 function text(value: unknown) {
   return { content: [{ type: 'text' as const, text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) }] }
@@ -148,37 +158,41 @@ async function loadToken(file: string, logger: BridgeLogger): Promise<string> {
   try {
     const token = (await readFile(path, 'utf8')).trim()
     if (token) return token
-  } catch { /* generated below */ }
+    throw new Error('TOKEN_EMPTY: refusing to replace an existing empty token')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
   const token = randomBytes(24).toString('hex')
-  await writeFile(path, token + '\n', { mode: 0o600 })
+  await mkdir(dirname(path), { recursive: true })
+  let tokenHandle
+  try { tokenHandle = await open(path, 'wx', 0o600) } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+    const existing = (await readFile(path, 'utf8')).trim()
+    if (!existing) throw new Error('TOKEN_EMPTY')
+    return existing
+  }
+  try { await tokenHandle.writeFile(token + '\n'); await tokenHandle.sync() } finally { await tokenHandle.close() }
   logger.info(`generated MCP token at ${path}`)
   return token
-}
-
-/** Counting semaphore for concurrent agent runs. */
-class Semaphore {
-  private waiters: (() => void)[] = []
-  private active = 0
-  constructor(private readonly limit: () => number) {}
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= Math.max(1, this.limit())) await new Promise<void>(r => this.waiters.push(r))
-    this.active++
-    try { return await fn() } finally {
-      this.active--
-      this.waiters.shift()?.()
-    }
-  }
 }
 
 export function apply(ctx: Context, config: BridgeConfig): void {
   const c = ctx as any
   const logger = createFileLogger(ctx.logger, join(dshHome(), 'mcp-bridge', 'bridge.log'))
   const ledger = new SessionLedger(join(dshHome(), 'mcp-bridge', 'sessions.json'))
-  const owned = new Map<string, { agent: any; dispose: () => Promise<void> }>()
+  type RouteControl = { current: any; assembled: any; taskSignal: AbortSignal; ready: Promise<void>; activate: () => void }
+  type Owned = { agent: any; dispose: () => Promise<void>; selection: RouteControl }
+  const owned = new Map<string, Owned>()
   const sessionLocks = new Map<string, Promise<unknown>>()
-  const taskStore = new TaskStore(join(dshHome(), 'mcp-bridge', 'tasks.json'))
+  const taskStore = new TaskStore(join(dshHome(), 'mcp-bridge', 'tasks.json'), () => logger.error('STORAGE_WRITE_FAILED: task progress durability degraded'))
+  const files = new SessionFiles(dshHome())
   const runtimes = new Map<string, TaskRuntime>()
-  const busySessions = () => new Set([...taskStore.records.values()].filter(r => ACTIVE.includes(r.status) && r.sessionId).map(r => r.sessionId!))
+  const dispatching = new Map<string, StoredTask>()
+  let unloading = false
+  const busySessions = () => new Set([
+    ...[...taskStore.records.values()].filter(r => ACTIVE.includes(r.status) && r.sessionId).map(r => r.sessionId!),
+    ...[...runtimes.values()].flatMap(r => r.sessionId ? [r.sessionId] : []),
+  ])
   const semaphore = new Semaphore(() => config.maxConcurrentTasks)
 
   // ---- model selection ---------------------------------------------------
@@ -189,43 +203,22 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     return c.get('agentDefaultModel')?.currentSelection?.()
   }
 
-  /** Resolve the effective provider/model/effort for one call, enforcing the toolbar mode. */
-  async function resolveSelection(model?: string, effort?: string): Promise<Selection> {
-    const cat = await catalog()
-    const fallback = defaultSelection()
-    if (config.mode.get() === 'single') {
-      const provider = config.singleProvider.get() || fallback?.provider
-      const locked = config.singleModel.get() || fallback?.model
-      if (!provider || !locked) throw new Error('单模型模式下尚未选择模型，请在 Harness 右下角工具栏选择')
-      if (model && model !== locked) {
-        throw new Error(`当前为单模型模式，已锁定 ${provider}/${locked}，不能改用 ${model}。可在 Harness 工具栏切换到供应商模式。`)
-      }
-      const lockedEffort = config.singleEffort.get() || undefined
-      if (effort && effort !== lockedEffort) {
-        throw new Error(`当前为单模型模式，推理等级已锁定为 ${lockedEffort ?? '模型默认'}，不能改用 ${effort}`)
-      }
-      if (!findModel(cat, provider, locked)) throw new Error(`锁定的模型 ${provider}/${locked} 当前不可用（凭据缺失或供应商已移除）`)
-      return { provider, model: locked, ...(lockedEffort ? { reasoningEffort: lockedEffort } : {}) }
+  function snapshot(): SelectionSettings {
+    return {
+      enabled: config.enabled.get(), mode: config.mode.get(),
+      singleProvider: config.singleProvider.get(), singleModel: config.singleModel.get(), singleEffort: config.singleEffort.get(),
+      providerId: config.providerId.get(), providerDefaultModel: config.providerDefaultModel.get(), providerDefaultEffort: config.providerDefaultEffort.get(),
+      providerAllowOverrides: config.providerAllowOverrides?.get() ?? false,
+      approvalMode: config.approvalMode?.get() ?? 'inherit',
+      defaultWorkspace: config.defaultWorkspace.get(), fallback: defaultSelection(),
     }
-    const provider = config.providerId.get() || fallback?.provider
-    if (!provider) throw new Error('供应商模式下尚未选择供应商，请在 Harness 右下角工具栏选择')
-    const group = cat.groups.find(g => g.id === provider)
-    if (!group) throw new Error(`供应商 ${provider} 当前不可用`)
-    const chosen = model || config.providerDefaultModel.get() || group.models[0]?.id
-    const entry = group.models.find(m => m.id === chosen)
-    if (!entry) {
-      throw new Error(`模型 ${chosen} 不属于供应商 ${provider}。可用：${group.models.map(m => m.id).join(', ')}`)
-    }
-    const efforts = entry.reasoning?.efforts.map(e => e.id) ?? []
-    if (effort && !efforts.includes(effort)) {
-      throw new Error(`模型 ${entry.id} 不支持推理等级 ${effort}。可用：${efforts.join(', ') || '（无）'}`)
-    }
-    // Caller's effort > toolbar default (when this model supports it) > the model's own default.
-    const preferred = config.providerDefaultEffort.get()
-    const reasoningEffort = effort
-      || (preferred && efforts.includes(preferred) ? preferred : undefined)
-      || entry.reasoning?.defaultEffort
-    return { provider, model: entry.id, ...(reasoningEffort ? { reasoningEffort } : {}) }
+  }
+
+  async function resolveSelection(model?: string, reasoningEffort?: string, provider?: string) {
+    const settings = snapshot()
+    const selection = select(settings, { model, reasoningEffort, provider }, await catalog())
+    if (configVersion(settings) !== configVersion(snapshot())) throw new Error('CONFIG_CONFLICT: 配置在解析期间改变，请重试')
+    return { selection, version: configVersion(settings), settings }
   }
 
   // ---- workspace resolution ---------------------------------------------
@@ -299,71 +292,125 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   /** Keep handles for reuse; evict the least recently used idle ones (never one with a running task). */
-  function remember(id: string, handle: { agent: any; dispose: () => Promise<void> }) {
+  function remember(id: string, handle: Owned) {
     owned.set(id, handle)
     const busy = busySessions()
     for (const [candidate, old] of owned) {
       if (owned.size <= MAX_OWNED_AGENTS) break
       if (candidate === id || busy.has(candidate)) continue
       owned.delete(candidate)
-      void old.dispose().catch(error => logger.warn(`dispose ${candidate} failed: ${String(error)}`))
+      void old.dispose().catch(error => logger.warn(`dispose ${candidate} failed`))
     }
   }
 
-  async function createAgent(args: TaskArgs, selection: Selection, target: { cwd: string; workspace?: WorkspaceLike }) {
+  function applyApproval(agent: any, mode: SelectionSettings['approvalMode'], initializing = false) {
+    // No grant is synthesized. 0.2.1-rc.2 supports ask/never and allowed-once only.
+    if (mode === 'inherit') return
+    if (initializing) setApprovalPolicy(agent.session, mode)
+    else {
+      const approval = c.get('approval')
+      if (!approval?.setPolicy) throw new Error('APPROVAL_UNAVAILABLE: 无法安全应用审批设置')
+      approval.setPolicy(agent, mode)
+    }
+  }
+
+  function routeControl(selection: Selection, taskSignal: AbortSignal): RouteControl {
+    let activate!: () => void
+    const ready = new Promise<void>(resolve => { activate = resolve })
+    return { current: agentOptions(selection), assembled: undefined, taskSignal, ready, activate }
+  }
+
+  function installRoute(agentCtx: Context, control: RouteControl) {
+    installModelSelection(agentCtx, control)
+    // Official resume may wake persisted inbox work before its Promise returns.
+    // Hold its first pre-step until admission is durable and monitoring is attached.
+    agentCtx.on('agent/pre-step', async (_payload, next) => {
+      const signal = control.taskSignal
+      signal.throwIfAborted()
+      let detach = () => {}
+      const aborted = new Promise<never>((_resolve, reject) => {
+        const onAbort = () => reject(signal.reason)
+        signal.addEventListener('abort', onAbort, { once: true })
+        detach = () => signal.removeEventListener('abort', onAbort)
+      })
+      try { await Promise.race([control.ready, aborted]); signal.throwIfAborted(); return await next() } finally { detach() }
+    })
+  }
+
+  async function createAgent(args: TaskArgs, selection: Selection, target: { cwd: string; workspace?: WorkspaceLike }, mode: SelectionSettings['approvalMode'], id: string, signal: AbortSignal) {
     const { cwd, workspace } = target
     const preset = await presetId()
-    const autoApprove = config.autoApprove.get()
-    const sessionId = SessionId(`session-${randomUUID()}`)
+    const control = routeControl(selection, signal)
+    const sessionId = SessionId(id)
     const handle = await c.agents.create({
-      sessionId,
-      meta: { cwd, agentPreset: preset },
-      agentOptions: agentOptions(selection),
+      sessionId, meta: { cwd, agentPreset: preset }, agentOptions: agentOptions(selection),
       setup: async (agentCtx: Context, agent: any) => {
         await c.agentPresets.mount(agentCtx, preset)
-        if (autoApprove) setApprovalPolicy(agent.session, 'never')
+        installRoute(agentCtx, control)
+        applyApproval(agent, mode, true)
       },
     })
-    remember(sessionId, handle)
-    if (workspace) {
-      await workspace.attachSession(sessionId).catch(error => logger.warn(`attach ${sessionId} failed: ${String(error)}`))
-    }
+    remember(sessionId, { ...handle, selection: control })
+    if (workspace) await workspace.attachSession(sessionId)
     const title = `[MCP] ${args.title || args.task.replace(/\s+/g, ' ').slice(0, 40)}`
-    try { c.get('sessionTitle')?.rename(handle.agent.session, title) } catch (error) {
-      logger.warn(`rename ${sessionId} failed: ${String(error)}`)
-    }
+    c.get('sessionTitle')?.rename(handle.agent.session, title)
     await ledger.add(sessionId, { title, createdAt: Date.now(), workspaceId: workspace?.id })
     return handle.agent
   }
 
-  async function continueAgent(id: string, selection: Selection) {
-    // An archived session's wakes are gated by the workspace registry; reopen it first.
-    const reg = registry()
-    if (reg.archivedSessionIds.map(String).includes(id)) await reg.unarchiveSession(SessionId(id))
+  async function continueAgent(id: string, selection: Selection, mode: SelectionSettings['approvalMode'], signal: AbortSignal) {
+    validateSessionId(id)
     const known = owned.get(id)
     if (known) {
-      owned.delete(id)
-      owned.set(id, known)
+      if (known.agent.status === 'running') throw new Error('SESSION_BUSY: Harness 中的会话仍在运行')
+      known.selection.current = agentOptions(selection)
+      known.selection.taskSignal = signal
+      applyApproval(known.agent, mode)
       return known.agent
     }
-    const live = c.agents.get(SessionId(id))
-    if (live) return live
+    // A bare live Agent has neither our disposer capability nor our routing hooks.
+    if (c.agents.get(SessionId(id))) throw new Error('CONFIG_CONFLICT: 非本插件拥有的 live 会话不能安全切换模型或审批配置，请先在 Harness 关闭该会话')
+    if (!(await ledger.get(id))) throw new Error('SESSION_NOT_MANAGED: 只能恢复本插件创建的磁盘会话')
+    await requireSession(id, false)
     const preset = await presetId()
+    const control = routeControl(selection, signal)
     const handle = await c.agents.resume({
-      resumeSessionId: SessionId(id),
-      agentOptions: agentOptions(selection),
-      setup: async (agentCtx: Context) => { await c.agentPresets.mount(agentCtx, preset) },
+      resumeSessionId: SessionId(id), agentOptions: agentOptions(selection),
+      setup: async (agentCtx: Context, agent: any) => {
+        await c.agentPresets.mount(agentCtx, preset)
+        installRoute(agentCtx, control)
+        applyApproval(agent, mode, true)
+      },
     })
-    remember(id, handle)
+    remember(id, { ...handle, selection: control })
     return handle.agent
   }
 
   async function withSessionLock<T>(id: string, fn: () => Promise<T>): Promise<T> {
     const previous = sessionLocks.get(id) ?? Promise.resolve()
     const next = previous.then(fn, fn)
-    sessionLocks.set(id, next.catch(() => undefined))
-    return next
+    const tail = next.catch(() => undefined)
+    sessionLocks.set(id, tail)
+    try { return await next } finally { if (sessionLocks.get(id) === tail) sessionLocks.delete(id) }
   }
+
+  // This is the resolved request envelope at the official dispatch seam, not a
+  // guessed TaskRecord selection or evidence of provider billing/receipt.
+  c.on('llm/stream', (request: any, next: () => AsyncIterable<any>) => {
+    const record = dispatching.get(String(request.sessionId))
+    if (!record) return next()
+    const observed: Selection = { provider: request.provider, model: request.model, ...(request.reasoningEffort === undefined ? {} : { reasoningEffort: String(request.reasoningEffort) }) }
+    const runtime = runtimes.get(record.id)
+    runtime?.controller.signal.throwIfAborted()
+    if (!sameSelection(record, observed)) throw new Error('CONFIG_CONFLICT: 实际请求与本任务锁定配置冲突，已阻止发送')
+    const stream = next()
+    record.effectiveSelection = observed
+    record.selectionEvidence = 'llm/stream'
+    record.requestCount = (record.requestCount ?? 0) + 1
+    taskStore.save()
+    logger.info(JSON.stringify({ taskId: record.id, sessionId: record.sessionId, configVersion: record.configVersion, event: 'request-dispatch', ...observed }))
+    return stream
+  }, { prepend: true })
 
   // ---- tasks ---------------------------------------------------------------
   //
@@ -387,7 +434,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     return { finalText: finalText.slice(0, 20000), toolCalls: toolCalls.slice(-50) }
   }
 
-  interface MonitorState { eventSeq: number; approvals: Map<string, { toolName: string; reason?: string }> }
+  interface MonitorState { eventSeq: number; approvals: Map<string, { toolName: string; reason?: string }>; singleUseSeen: boolean }
 
   /** Sample one running task's session into its progress record. */
   function sample(record: StoredTask, agent: any, state: MonitorState) {
@@ -406,11 +453,26 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
     try {
       for (const event of agent.session.snapshotEvents(state.eventSeq)) {
-        if (event.type === 'approval/asked') state.approvals.set(String(event.data.id), { toolName: event.data.toolName, ...(event.data.reason ? { reason: event.data.reason } : {}) })
-        else if (event.type === 'approval/decided') state.approvals.delete(String(event.data.id))
+        if (event.type === 'approval/asked') {
+          const tool = String(event.data.toolName)
+          state.approvals.set(String(event.data.id), { toolName: tool })
+          const reason = state.singleUseSeen ? 'no-reusable-grant; previous-result-allowed-once' : 'operation-requires-approval; scope-not-persisted'
+          if (Number(event.seq) >= (record.eventBaseline ?? 0)) {
+            record.approvalDiagnostics = [...(record.approvalDiagnostics ?? []), { tool, reason }].slice(-40)
+            logger.info(JSON.stringify({ taskId: record.id, sessionId: record.sessionId, configVersion: record.configVersion, approval: record.approval, event: 'approval-request', tool, grantHit: false, reason }))
+          }
+        } else if (event.type === 'approval/decided') {
+          const tool = state.approvals.get(String(event.data.id))?.toolName ?? 'unknown'
+          state.approvals.delete(String(event.data.id))
+          if (event.data.outcome === 'allowed-once') state.singleUseSeen = true
+          if (Number(event.seq) >= (record.eventBaseline ?? 0)) {
+            record.approvalDiagnostics = [...(record.approvalDiagnostics ?? []), { tool, outcome: String(event.data.outcome), reason: 'official-approval-result' }].slice(-40)
+            logger.info(JSON.stringify({ taskId: record.id, sessionId: record.sessionId, configVersion: record.configVersion, event: 'approval-decided', tool, outcome: event.data.outcome }))
+          }
+        }
       }
       state.eventSeq = Number(agent.session.seq)
-    } catch { /* event reads are best-effort */ }
+    } catch { logger.warn(`task ${record.id}: approval diagnostics unavailable`) }
     const pendingApproval = [...state.approvals.values()].at(-1)
     const previous = record.progress
     const changed = steps !== previous.steps || toolCalls !== previous.toolCalls || !!pendingApproval !== !!previous.pendingApproval
@@ -427,105 +489,166 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     taskStore.save()
   }
 
-  /** Run the prompt on an agent and follow it to idle. Shared by fresh runs and reattached ones. */
-  async function follow(record: StoredTask, agent: any, runtime: TaskRuntime, prompt?: string) {
-    const state: MonitorState = { eventSeq: Number(agent.session.seq ?? 0), approvals: new Map() }
-    let cancelled = false
-    runtime.cancel = () => {
-      cancelled = true
-      agent.cancel({ kind: 'user' })
-    }
-    if (prompt !== undefined) {
-      record.baseline = agent.session.deriveMessages().length
-      record.status = 'running'
-      record.startedAt = Date.now()
-      taskStore.save()
-      agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } } as any))
-    }
-    const timer = setInterval(() => {
-      try { sample(record, agent, state) } catch (error) { logger.warn(`monitor ${record.id}: ${String(error)}`) }
-    }, MONITOR_INTERVAL_MS)
+  async function durable(record: StoredTask) {
+    record.durability = 'pending'
     try {
-      await agent.whenIdle()
+      await taskStore.flush()
+      record.durability = 'durable'
+      delete record.persistenceError
+    } catch (error) {
+      record.durability = 'degraded'
+      record.persistenceError = 'STORAGE_WRITE_FAILED'
+      throw error
+    }
+  }
+
+  /** whenIdle is only a boundary; the owned log suffix supplies the outcome. */
+  async function follow(record: StoredTask, agent: any, runtime: TaskRuntime, prompt?: string) {
+    const signal = runtime.controller.signal
+    signal.throwIfAborted()
+    if (unloading) throw new Error('BRIDGE_UNLOADING')
+    const state: MonitorState = { eventSeq: 0, approvals: new Map(), singleUseSeen: false }
+    const cancel = () => agent.cancel({ kind: 'user' })
+    signal.addEventListener('abort', cancel, { once: true })
+    let timer: ReturnType<typeof setInterval> | undefined
+    try {
+      if (prompt !== undefined) {
+        record.baseline = agent.session.deriveMessages().length
+        record.eventBaseline = Number(agent.session.seq)
+        record.status = 'running'
+        record.startedAt = Date.now()
+        await durable(record)
+        signal.throwIfAborted()
+        if (configVersion(snapshot()) !== record.configVersion) throw new Error('CONFIG_CONFLICT: 配置在启动准备期间改变，请重试')
+        dispatching.set(record.sessionId!, record)
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'user' } } as any))
+        owned.get(record.sessionId!)?.selection.activate()
+      } else dispatching.set(record.sessionId!, record)
+      sample(record, agent, state)
+      timer = setInterval(() => {
+        try { sample(record, agent, state) } catch { logger.warn(`monitor ${record.id}: sample failed`) }
+      }, MONITOR_INTERVAL_MS)
+      let detached = false
+      const detachedDone = new Promise<void>(resolve => { runtime.detach = () => { detached = true; resolve() } })
+      await Promise.race([agent.whenIdle(), detachedDone])
+      runtime.detach = undefined
+      if (detached) { record.status = 'interrupted'; record.error = 'Plugin observer unloaded; live work remains with its owner'; return }
+      sample(record, agent, state)
+      record.result = summarize(agent.session.deriveMessages().slice(record.baseline ?? 0))
+      const events = agent.session.snapshotEvents(record.eventBaseline ?? 0)
+      const reason = foldConsumedWork(events).end?.data.reason
+      record.termination = reason ?? { kind: 'missing-turn-end' }
+      if (signal.aborted || record.status === 'cancelled') record.status = 'cancelled'
+      else if (reason?.kind === 'completed') record.status = 'done'
+      else if (reason?.kind === 'aborted') record.status = reason.reason.kind === 'disposed' ? 'interrupted' : 'cancelled'
+      else if (reason?.kind === 'error' || reason?.kind === 'blocked' || reason?.kind === 'max-tokens') {
+        record.status = 'failed'
+        record.error = reason.kind === 'error' ? reason.error.message : reason.kind
+      } else { record.status = 'interrupted'; record.error = 'No accounting turn/end for this task' }
+      delete record.progress.pendingApproval
     } finally {
       clearInterval(timer)
+      signal.removeEventListener('abort', cancel)
+      if (dispatching.get(record.sessionId!) === record) dispatching.delete(record.sessionId!)
     }
-    sample(record, agent, state)
-    record.result = summarize(agent.session.deriveMessages().slice(record.baseline ?? 0))
-    record.status = cancelled ? 'cancelled' : 'done'
-    delete record.progress.pendingApproval
-    record.finishedAt = Date.now()
   }
 
   function track(record: StoredTask, work: (runtime: TaskRuntime) => Promise<void>): TaskRuntime {
-    const runtime: TaskRuntime = { done: Promise.resolve() }
+    const controller = new AbortController()
+    const runtime: TaskRuntime = { done: Promise.resolve(), controller, sessionId: record.sessionId }
+    runtime.cancel = () => {
+      if (ACTIVE.includes(record.status)) {
+        record.status = 'cancelled'
+        record.finishedAt = Date.now()
+        controller.abort(new Error('TASK_CANCELLED'))
+      }
+    }
     runtimes.set(record.id, runtime)
     runtime.done = work(runtime).catch(error => {
-      record.status = 'failed'
-      record.error = error instanceof Error ? error.message : String(error)
-      logger.warn(`task ${record.id} failed: ${record.error}`)
-    }).finally(() => {
+      if (!controller.signal.aborted && record.status !== 'cancelled') {
+        record.status = 'failed'
+        record.error = error instanceof Error ? error.message : String(error)
+        controller.abort(error)
+      }
+      logger.warn(`task ${record.id} ended status=${record.status}`)
+    }).finally(async () => {
       record.finishedAt ??= Date.now()
       runtime.cancel = undefined
-      taskStore.save()
+      runtime.detach = undefined
+      try { await durable(record) } catch { logger.error(`task ${record.id}: terminal state is not durable`) }
+      runtimes.delete(record.id)
     })
     return runtime
   }
 
-  /** Validate synchronously (bad model / workspace fail the call), then run in the background. */
+  /** Validate at admission; resolve again after queueing, under the session lock. */
   async function launch(args: TaskArgs): Promise<StoredTask> {
-    const selection = await resolveSelection(args.model, args.reasoningEffort)
-    const target = args.sessionId ? undefined : await resolveTarget(args)
+    await ready
+    if (unloading) throw new Error('BRIDGE_UNLOADING')
+    if (args.sessionId) validateSessionId(args.sessionId)
+    const initial = await resolveSelection(args.model, args.reasoningEffort, args.provider)
+    if (!args.sessionId) await resolveTarget(args)
     const now = Date.now()
     const record: StoredTask = {
-      id: `task-${randomUUID()}`,
-      status: 'queued',
-      task: args.task.slice(0, 2000),
-      createdAt: now,
-      ...selection,
-      ...(target ? { cwd: target.cwd } : {}),
-      ...(target?.workspace ? { workspace: { id: target.workspace.id, title: target.workspace.title, path: target.workspace.path } } : {}),
+      id: `task-${randomUUID()}`, status: 'queued', task: args.task.slice(0, 2000), createdAt: now,
+      sessionId: args.sessionId ?? `session-${randomUUID()}`,
+      ...initial.selection, requestedSelection: { ...(args.provider === undefined ? {} : { provider: args.provider }), ...(args.model === undefined ? {} : { model: args.model }), ...(args.reasoningEffort === undefined ? {} : { reasoningEffort: args.reasoningEffort }) },
+      effectiveSelection: null, configVersion: initial.version, configSource: 'toolbar-v2',
       progress: { steps: 0, toolCalls: 0, lastActivityAt: now },
     }
     taskStore.records.set(record.id, record)
-    taskStore.save()
-    track(record, async runtime => {
-      let cancelledEarly = false
-      runtime.cancel = () => { cancelledEarly = true }
-      await semaphore.run(async () => {
-        if (cancelledEarly) {
-          record.status = 'cancelled'
-          return
-        }
-        const agent = args.sessionId
-          ? await continueAgent(args.sessionId, selection)
-          : await createAgent(args, selection, target!)
-        record.sessionId = String(agent.session.header.id)
-        record.cwd ??= agent.session.header.cwd
-        await withSessionLock(record.sessionId, () => follow(record, agent, runtime, args.task))
-      })
-    })
+    try { await durable(record) } catch (error) { taskStore.records.delete(record.id); throw error }
+    track(record, runtime => withSessionLock(record.sessionId!, () => semaphore.run(async () => {
+      runtime.controller.signal.throwIfAborted()
+      const resolved = await resolveSelection(args.model, args.reasoningEffort, args.provider)
+      runtime.controller.signal.throwIfAborted()
+      const target = args.sessionId ? undefined : await resolveTarget(args)
+      runtime.controller.signal.throwIfAborted()
+      delete record.reasoningEffort
+      Object.assign(record, resolved.selection, { configVersion: resolved.version })
+      const agent = args.sessionId
+        ? await continueAgent(args.sessionId, resolved.selection, resolved.settings.approvalMode, runtime.controller.signal)
+        : await createAgent(args, resolved.selection, target!, resolved.settings.approvalMode, record.sessionId!, runtime.controller.signal)
+      runtime.controller.signal.throwIfAborted()
+      const reg = registry()
+      if (reg.archivedSessionIds.map(String).includes(record.sessionId!)) await reg.unarchiveSession(SessionId(record.sessionId!))
+      runtime.controller.signal.throwIfAborted()
+      record.cwd = agent.session.header.cwd
+      if (target?.workspace) record.workspace = { id: target.workspace.id, title: target.workspace.title, path: target.workspace.path }
+      record.approval = {
+        mode: c.get('approval')?.effectivePolicy?.(agent.session) ?? 'unknown', source: resolved.settings.approvalMode === 'inherit' ? 'session-or-harness-default' : 'toolbar-managed-session',
+        preset: c.get('permissionPresets')?.current?.(agent.session), persistentGrants: false,
+        sandbox: [...agent.session.snapshotEvents()].reverse().find((e: any) => e.type === 'sandbox/mode')?.data.mode ?? c.get('shell')?.sandboxMode,
+      }
+      await follow(record, agent, runtime, args.task)
+    }, runtime.controller.signal)))
     return record
   }
 
-  /** After a restart, keep following tasks whose agent is still alive; mark the rest interrupted. */
   async function recoverTasks() {
     await taskStore.load()
+    await ledger.entries()
+    const claimed = new Set<string>()
     for (const record of taskStore.records.values()) {
-      if (!ACTIVE.includes(record.status) || runtimes.has(record.id)) continue
+      if (!ACTIVE.includes(record.status)) continue
       const agent = record.sessionId ? c.agents.get(SessionId(record.sessionId)) : undefined
-      if (agent && record.baseline !== undefined) {
-        logger.info(`reattaching task ${record.id} to live session ${record.sessionId}`)
-        track(record, runtime => follow(record, agent, runtime))
-        continue
+      if (agent && record.baseline !== undefined && record.eventBaseline !== undefined && !claimed.has(record.sessionId!)) {
+        validateSessionId(record.sessionId!)
+        claimed.add(record.sessionId!)
+        // Observe existing work without modifying another owner's route or permissions.
+        // Adopted work reserves capacity before new admissions are enabled.
+        track(record, runtime => withSessionLock(record.sessionId!, () => semaphore.run(() => follow(record, agent, runtime), undefined, true)))
+      } else {
+        record.status = 'interrupted'
+        record.error = 'Harness/插件生命周期已结束，或缺少可验证的任务边界；可使用 sessionId 显式恢复'
+        record.finishedAt = Date.now()
       }
-      record.status = 'interrupted'
-      record.error = 'Harness 重启或插件重载导致任务中断。会话已保存，可用 run_task 带 sessionId 让它继续。'
-      record.finishedAt = Date.now()
     }
-    taskStore.save()
+    await taskStore.flush()
   }
-  void recoverTasks().catch(error => logger.warn(`recover tasks failed: ${String(error)}`))
+  let startupError: string | undefined
+  const ready = recoverTasks().catch(error => { startupError = 'STORAGE_RECOVERY_FAILED'; throw error })
+  void ready.catch(() => logger.error('STORAGE_RECOVERY_FAILED: task admission blocked'))
 
   function describeProgress(record: StoredTask): string {
     const minutes = Math.floor((Date.now() - (record.startedAt ?? record.createdAt)) / 60_000)
@@ -551,7 +674,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
    */
   async function waitFor(record: StoredTask, extra: any, timeoutSec?: number): Promise<void> {
     const runtime = runtimes.get(record.id)
-    if (!runtime || !ACTIVE.includes(record.status)) return
+    if (!runtime) return
     const token = extra?._meta?.progressToken
     let count = 0
     const tick = setInterval(() => {
@@ -565,12 +688,19 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     const waits: Promise<unknown>[] = [runtime.done]
     if (timeoutSec && timeoutSec > 0) waits.push(new Promise(done => { timer = setTimeout(done, timeoutSec * 1000) }))
     const signal: AbortSignal | undefined = extra?.signal
-    if (signal) waits.push(new Promise(done => signal.addEventListener('abort', done, { once: true })))
+    let detachAbort = () => {}
+    if (signal) waits.push(new Promise(done => {
+      if (signal.aborted) { done(undefined); return }
+      const onAbort = () => done(undefined)
+      signal.addEventListener('abort', onAbort, { once: true })
+      detachAbort = () => signal.removeEventListener('abort', onAbort)
+    }))
     try {
       await Promise.race(waits)
     } finally {
       clearInterval(tick)
       clearTimeout(timer)
+      detachAbort()
     }
   }
 
@@ -581,44 +711,60 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   ctx.effect(() => () => {
-    for (const record of taskStore.records.values()) {
-      if (ACTIVE.includes(record.status)) logger.info(`plugin unloading; task ${record.id} keeps running in Harness`)
+    unloading = true
+    // The official factory attaches created handles to the plugin's owner fiber;
+    // unload drains/disposes them. Do not promise that these agents survive HMR.
+    for (const [id, runtime] of runtimes) {
+      const record = taskStore.records.get(id)!
+      if (owned.has(record.sessionId!)) runtime.cancel?.()
+      else runtime.detach?.()
     }
-    void taskStore.flush()
-    // Agents still working are left alive; a reloaded instance reattaches to them.
-    const handles = [...owned.entries()]
+    const handles = [...owned.values()]
     owned.clear()
-    for (const [id, handle] of handles) {
-      if (!busySessions().has(id)) void handle.dispose().catch(() => undefined)
-    }
+    return Promise.allSettled(handles.map(h => h.dispose())).then(async () => {
+      await Promise.allSettled([...runtimes.values()].map(r => r.done))
+      await taskStore.flush()
+    })
   }, 'mcp-bridge: owned agents')
 
   // ---- workspaces & sessions ----------------------------------------------
 
-  async function sessionDirectory(id: string): Promise<string | undefined> {
-    const root = join(dshHome(), 'sessions')
-    for (const bucket of await readdir(root).catch(() => [] as string[])) {
-      const candidate = join(root, bucket, id)
-      if ((await stat(candidate).catch(() => undefined))?.isDirectory()) return candidate
-    }
-    return undefined
+  function requireStorageRoot() {
+    // This pinned backend exposes its configured root as a JS data property.
+    // Use it only as a refusal guard, never as a caller-controlled delete target.
+    const root = c.sessionPersistence.root
+    if (typeof root !== 'string' || !samePath(root, join(dshHome(), 'sessions'))) throw new Error('UNSUPPORTED_SESSION_STORAGE: 仅支持已核对的 $DSH_HOME/sessions JSONL 存储根')
+  }
+
+  async function requireSession(id: string, destructive = true) {
+    validateSessionId(id)
+    // Validate all destructive roots before asking the official reader to verify identity.
+    if (destructive) { requireStorageRoot(); await files.directory(id); await files.cache(id) }
+    const snapshot = await c.sessionPersistence.stat(SessionId(id))
+    const live = c.agents.get(SessionId(id))
+    if (snapshot?.header?.id !== id && live?.session?.header?.id !== id) throw new Error('SESSION_NOT_FOUND: 无法验证真实会话')
+    return snapshot
   }
 
   async function sessionTitle(id: string): Promise<string | undefined> {
-    const cache = join(dshHome(), 'storages', 'session_projcache', 'sessions', `${id}.json`)
+    const cache = await files.cache(id)
     try {
-      const value = JSON.parse(await readFile(cache, 'utf8'))?.record?.rows?.title?.val
+      const value = JSON.parse(cache ? await readFile(cache, 'utf8') : '{}')?.record?.rows?.title?.val
       if (typeof value === 'string') return value
     } catch { /* not cached */ }
     return (await ledger.get(id))?.title
   }
 
   async function describeSession(id: string) {
+    requireStorageRoot()
     const reg = registry()
-    const directory = await sessionDirectory(id)
-    const modified = directory ? (await stat(directory).catch(() => undefined))?.mtimeMs : undefined
+    validateSessionId(id)
+    const activity = await files.activity(id)
+    const snapshot = await c.sessionPersistence.stat(SessionId(id))
+    const modified = activity.updatedAt
     return {
       sessionId: id,
+      version: JSON.stringify([activity.version, snapshot?.revision ?? null, c.agents.get(SessionId(id))?.session?.seq ?? null, reg.archivedSessionIds.map(String).includes(id)]),
       title: await sessionTitle(id),
       mcp: (await ledger.get(id)) !== undefined,
       archived: reg.archivedSessionIds.includes(id),
@@ -643,136 +789,142 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   // live handle still holds are queued and removed on the next start.
 
   const pendingDeletesFile = join(dshHome(), 'mcp-bridge', 'pending-deletes.json')
-  interface PendingDelete { id: string; directory?: string; unarchive?: boolean }
-
-  async function readPending(): Promise<PendingDelete[]> {
-    try { return JSON.parse(await readFile(pendingDeletesFile, 'utf8')) } catch { return [] }
+  interface PendingDelete { id: string; version?: string; directory?: string }
+  const pendingWriter = new JsonWriter(pendingDeletesFile)
+  let deleteQueue = Promise.resolve()
+  const readPending = () => readJson<PendingDelete[]>(pendingDeletesFile, () => [])
+  async function updatePending(update: (items: PendingDelete[]) => PendingDelete[]) {
+    const operation = deleteQueue.catch(() => undefined).then(async () => {
+      const items = await readPending()
+      if (!Array.isArray(items)) throw new Error('INVALID_PENDING_DELETES')
+      await pendingWriter.write(update(items))
+    })
+    deleteQueue = operation
+    return operation
   }
-  async function writePending(list: PendingDelete[]) {
-    await mkdir(join(dshHome(), 'mcp-bridge'), { recursive: true })
-    await writeFile(pendingDeletesFile, JSON.stringify(list, null, 2))
-  }
 
-  async function removeTree(path: string): Promise<boolean> {
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        await rm(path, { recursive: true, force: true })
-        return true
-      } catch {
-        await new Promise(done => setTimeout(done, 400))
+  async function deleteSession(id: string, expectedVersion?: string): Promise<{ deleted: string; note?: string }> {
+    validateSessionId(id)
+    if (busySessions().has(id)) throw new Error('SESSION_BUSY: 会话仍有 MCP 任务或取消尚未完成')
+    return withSessionLock(id, async () => {
+      await requireSession(id)
+      if (expectedVersion !== undefined && (await describeSession(id)).version !== expectedVersion) throw new Error('SESSION_CHANGED: 预览后会话已改变，请重新确认')
+      const fileVersion = (await files.activity(id)).version
+      if (busySessions().has(id)) throw new Error('SESSION_BUSY: 会话仍有 MCP 任务或取消尚未完成')
+      const sid = SessionId(id)
+      const reg = registry()
+      const handle = owned.get(id)
+      if (handle) { await handle.dispose(); owned.delete(id) }
+      const resident = c.agents.get(sid)
+      if (resident) {
+        await reg.archiveSession(sid, { stopActivity: true })
+        // Another owner can still hold a persistence writer after idle. Keep files
+        // until that owner has gone; never dispose its handle or delete under it.
+        const version = (await files.activity(id)).version
+        await updatePending(items => [...items.filter(p => p.id !== id), { id, version }])
+      } else {
+        // Revalidate cache/junctions BEFORE removing any session files.
+        await requireSession(id)
+        if (expectedVersion !== undefined && (await files.activity(id)).version !== fileVersion) throw new Error('SESSION_CHANGED: owner 释放期间日志已改变，请重新确认')
+        await files.cache(id)
+        await files.remove(id)
       }
-    }
-    return false
+      for (const workspace of reg.list().filter(w => w.sessionIds.map(String).includes(id))) await workspace.detachSession?.(sid)
+      if (reg.pinnedSessionIds.map(String).includes(id)) await reg.unpinSession(sid)
+      if (!resident && reg.archivedSessionIds.map(String).includes(id)) await reg.unarchiveSession(sid)
+      if (!resident) await ledger.remove(id)
+      logger.info(JSON.stringify({ event: 'session-delete', sessionId: id, pending: !!resident }))
+      return { deleted: id, ...(resident ? { note: '会话已停止并从列表移除；其他 owner 释放文件后再安全删除。若文件改变将要求重新确认。' } : {}) }
+    })
   }
 
-  async function deleteSession(id: string): Promise<{ deleted: string; note?: string }> {
-    const reg = registry()
-    const sid = SessionId(id)
-    if (busySessions().has(id)) throw new Error(`会话 ${id} 还有正在执行的 MCP 任务，先用 cancel_task 取消再删除`)
-    const handle = owned.get(id)
-    if (handle) {
-      owned.delete(id)
-      await handle.dispose()
-    }
-    const resident = c.agents.get(sid)
-    if (resident) {
-      await reg.archiveSession(sid, { stopActivity: true })
-      await Promise.race([resident.whenIdle?.(), new Promise(done => setTimeout(done, 10_000))]).catch(() => undefined)
-    }
-    const directory = await sessionDirectory(id)
-    const holders = reg.list().filter(w => w.sessionIds.map(String).includes(id))
-    if (!directory && holders.length === 0 && !resident) throw new Error(`找不到会话 ${id}`)
-    for (const workspace of holders) await workspace.detachSession?.(sid)
-    if (reg.pinnedSessionIds.map(String).includes(id)) await reg.unpinSession(sid)
-    // A resident session stays archived (so it cannot wake) until the next start clears the id.
-    if (!resident && reg.archivedSessionIds.map(String).includes(id)) await reg.unarchiveSession(sid)
-    await rm(join(dshHome(), 'storages', 'session_projcache', 'sessions', `${id}.json`), { force: true }).catch(() => undefined)
-    const removed = directory ? await removeTree(directory) : true
-    await ledger.remove(id)
-    if (!removed || resident) {
-      const pending = (await readPending()).filter(p => p.id !== id)
-      pending.push({ id, ...(removed ? {} : { directory }), ...(resident ? { unarchive: true } : {}) })
-      await writePending(pending)
-    }
-    logger.info(`deleted session ${id}${removed ? '' : ' (files queued)'}`)
-    return removed
-      ? { deleted: id }
-      : { deleted: id, note: '会话已从列表移除；部分文件仍被 Harness 占用，下次启动 Harness 时自动清理' }
-  }
-
-  /** Finish deletions that a live file handle or a resident agent blocked last time. */
   async function finishPendingDeletes() {
+    await ready
     const pending = await readPending()
-    if (!pending.length) return
-    const reg = registry()
-    const left: PendingDelete[] = []
+    if (!Array.isArray(pending)) throw new Error('INVALID_PENDING_DELETES')
     for (const item of pending) {
-      if (c.agents.get(SessionId(item.id))) {
-        left.push(item)
-        continue
-      }
-      const removed = item.directory ? await removeTree(item.directory) : true
-      if (item.unarchive && reg.archivedSessionIds.map(String).includes(item.id)) {
-        await reg.unarchiveSession(SessionId(item.id)).catch(() => undefined)
-      }
-      if (!removed) left.push(item)
+      try {
+        validateSessionId(item.id)
+        if (!item.version || item.directory) throw new Error('LEGACY_PENDING_DELETE_REQUIRES_CONFIRMATION')
+        if (c.agents.get(SessionId(item.id)) || busySessions().has(item.id)) continue
+        await withSessionLock(item.id, async () => {
+          await requireSession(item.id)
+          if ((await files.activity(item.id)).version !== item.version) throw new Error('SESSION_CHANGED')
+          await files.cache(item.id)
+          await files.remove(item.id)
+          await ledger.remove(item.id)
+          if (registry().archivedSessionIds.map(String).includes(item.id)) await registry().unarchiveSession(SessionId(item.id))
+          await updatePending(items => items.filter(p => p.id !== item.id))
+        })
+      } catch { logger.warn('pending delete refused: invalid boundary, changed files, or legacy confirmation required') }
     }
-    await writePending(left)
-    logger.info(`pending deletes: finished ${pending.length - left.length}, remaining ${left.length}`)
   }
   ctx.effect(() => {
-    const timer = setTimeout(() => { void finishPendingDeletes().catch(error => logger.warn(`pending deletes: ${String(error)}`)) }, 5_000)
+    const timer = setTimeout(() => { void finishPendingDeletes().catch(() => logger.warn('pending deletes failed')) }, 5_000)
     return () => clearTimeout(timer)
   }, 'mcp-bridge: pending deletes')
 
   type BatchAction = 'archive' | 'unarchive' | 'delete'
   interface BatchFilter { mcpOnly?: boolean; olderThanDays?: number; includeArchived?: boolean }
 
-  async function manageSessions(query: string, action: BatchAction, filter: BatchFilter, confirm: boolean) {
+  type SessionRow = Awaited<ReturnType<typeof describeSession>>
+  const previews = new Map<string, { expires: number; workspace: string; action: BatchAction; mcpOnly: boolean; targets: SessionRow[] }>()
+  async function manageSessions(query: string, action: BatchAction, filter: BatchFilter, confirm: boolean, previewToken?: string) {
+    await ready
+    if (filter.olderThanDays !== undefined && (!Number.isFinite(filter.olderThanDays) || filter.olderThanDays < 0)) throw new Error('INVALID_FILTER')
     const includeArchived = action === 'unarchive' ? true : filter.includeArchived ?? action === 'delete'
     const { workspace, sessions } = await listSessions(query, includeArchived)
+    const mcpOnly = filter.mcpOnly ?? true
     const cutoff = filter.olderThanDays === undefined ? undefined : Date.now() - filter.olderThanDays * 86_400_000
-    const targets = sessions.filter(s =>
-      (!filter.mcpOnly || s.mcp)
-      && (action !== 'unarchive' || s.archived)
-      && (action !== 'archive' || !s.archived)
+    let targets = sessions.filter(s =>
+      (!mcpOnly || s.mcp) && (action !== 'unarchive' || s.archived) && (action !== 'archive' || !s.archived)
       && (cutoff === undefined || (s.updatedAt !== undefined && Date.parse(s.updatedAt) < cutoff)))
-    if (!confirm) return { workspace, action, dryRun: true, count: targets.length, targets, hint: '确认无误后带 confirm: true 再调用一次' }
-    const reg = registry()
+    for (const [key, value] of previews) if (value.expires < Date.now()) previews.delete(key)
+    if (!confirm) {
+      if (previews.size >= 500) throw new Error('PREVIEW_LIMIT: 请稍后重试')
+      const token = randomBytes(24).toString('hex')
+      previews.set(token, { expires: Date.now() + 60_000, workspace: workspace.id, action, mcpOnly, targets })
+      return { workspace, action, dryRun: true, mcpOnly, count: targets.length, targets, previewToken: token, expiresInSec: 60, hint: '确认这些具体 ID 后携带 previewToken 与 confirm: true；mcpOnly:false 明确包含个人会话' }
+    }
+    if (previewToken) {
+      const preview = previews.get(previewToken)
+      if (!preview || preview.expires < Date.now() || preview.workspace !== workspace.id || preview.action !== action || preview.mcpOnly !== mcpOnly) throw new Error('CONFIRMATION_EXPIRED: 请重新预览并确认')
+      targets = preview.targets
+      for (const target of targets) if ((await describeSession(target.sessionId)).version !== target.version) throw new Error('SESSION_CHANGED: 预览后会话发生变化，请重新确认')
+      previews.delete(previewToken)
+    } else if (action === 'delete' || !mcpOnly) throw new Error('CONFIRMATION_REQUIRED: 永久删除或包含个人会话必须携带预览令牌')
     const results: { sessionId: string; ok: boolean; detail?: string }[] = []
     for (const target of targets) {
       try {
-        if (action === 'archive') await reg.archiveSession(SessionId(target.sessionId), { stopActivity: true })
-        else if (action === 'unarchive') await reg.unarchiveSession(SessionId(target.sessionId))
-        else results.push({ sessionId: target.sessionId, ok: true, detail: (await deleteSession(target.sessionId)).note })
-        if (action !== 'delete') results.push({ sessionId: target.sessionId, ok: true })
-      } catch (error) {
-        results.push({ sessionId: target.sessionId, ok: false, detail: error instanceof Error ? error.message : String(error) })
-      }
+        if (action === 'delete') results.push({ sessionId: target.sessionId, ok: true, detail: (await deleteSession(target.sessionId, target.version)).note })
+        else {
+          await withSessionLock(target.sessionId, async () => {
+            await requireSession(target.sessionId)
+            if (busySessions().has(target.sessionId)) throw new Error('SESSION_BUSY')
+            if (action === 'archive') await registry().archiveSession(SessionId(target.sessionId), { stopActivity: true })
+            else await registry().unarchiveSession(SessionId(target.sessionId))
+          })
+          results.push({ sessionId: target.sessionId, ok: true })
+        }
+      } catch (error) { results.push({ sessionId: target.sessionId, ok: false, detail: error instanceof Error ? error.message : String(error) }) }
     }
     return { workspace, action, done: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results }
   }
 
-  /** Delete MCP-created sessions whose files were last modified more than `days` days ago. */
   async function cleanupOldSessions(days: number) {
+    await ready
     const cutoff = Date.now() - days * 86_400_000
     const deleted: string[] = []
     const failed: { sessionId: string; detail: string }[] = []
     for (const [id] of await ledger.entries()) {
-      if (c.agents.get(SessionId(id)) !== undefined) continue
-      const directory = await sessionDirectory(id)
-      if (!directory) {
-        await ledger.remove(id)
-        continue
-      }
-      const modified = (await stat(directory).catch(() => undefined))?.mtimeMs
-      if (modified === undefined || modified >= cutoff) continue
       try {
-        await deleteSession(id)
+        validateSessionId(id)
+        if (c.agents.get(SessionId(id)) || busySessions().has(id)) continue
+        const row = await describeSession(id)
+        if (row.updatedAt === undefined || Date.parse(row.updatedAt) >= cutoff) continue
+        await deleteSession(id, row.version)
         deleted.push(id)
-      } catch (error) {
-        failed.push({ sessionId: id, detail: error instanceof Error ? error.message : String(error) })
-      }
+      } catch { failed.push({ sessionId: id, detail: 'Session boundary, activity, or storage validation failed' }) }
     }
     return { at: Date.now(), days, deleted: deleted.length, failed }
   }
@@ -798,6 +950,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     manageAction?: BatchAction
     filter?: BatchFilter
     confirm?: boolean
+    previewToken?: string
   }
 
   async function writeBack(patch: Record<string, string>) {
@@ -823,7 +976,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         return deleteSession(command.sessionId)
       case 'manage-sessions':
         if (!command.workspace || !command.manageAction) throw new Error('缺少 workspace 或 action')
-        return manageSessions(command.workspace, command.manageAction, command.filter ?? {}, command.confirm === true)
+        return manageSessions(command.workspace, command.manageAction, command.filter ?? {}, command.confirm === true, command.previewToken)
       case 'cleanup-now': {
         const days = config.autoCleanupDays.get()
         if (days <= 0) throw new Error('未设置自动清理天数')
@@ -854,7 +1007,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     } catch (error) {
       reply = { id: command.id, ok: false, error: error instanceof Error ? error.message : String(error) }
     }
-    await writeBack({ command: '', commandResult: JSON.stringify(reply) })
+    await writeBack({ ...(config.command.get() === raw ? { command: '' } : {}), commandResult: JSON.stringify(reply) })
       .then(() => logger.info(`toolbar command ${command.id} answered ok=${String(reply.ok)}`))
       .catch(error => logger.error(`toolbar reply failed: ${error instanceof Error ? error.stack : String(error)}`))
   }
@@ -906,7 +1059,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     return {
       enabled: config.enabled.get(),
       mode,
-      autoApprove: config.autoApprove.get(),
+      autoApprove: false,
+      legacyAutoApproveIgnored: config.autoApprove.get(),
+      approvalMode: snapshot().approvalMode,
+      persistentAuthorizationSupported: false,
+      providerAllowOverrides: snapshot().providerAllowOverrides,
+      configVersion: configVersion(snapshot()), configSource: 'toolbar-v2',
+      startupError, storageError: taskStore.error,
       defaultWorkspace: workspace ? { id: workspace.id, title: workspace.title, path: workspace.path } : null,
       ...(mode === 'single'
         ? { model: { provider: config.singleProvider.get() || fallback?.provider, model: config.singleModel.get() || fallback?.model, reasoningEffort: config.singleEffort.get() || null } }
@@ -925,27 +1084,30 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     }
     const provider = config.providerId.get() || fallback?.provider
     const group = cat.groups.find(g => g.id === provider)
-    return { mode: 'provider', locked: false, provider, defaultModel: config.providerDefaultModel.get() || group?.models[0]?.id, models: group?.models ?? [] }
+    const overrides = config.providerAllowOverrides?.get() ?? false
+    const defaultModel = config.providerDefaultModel.get() || group?.models[0]?.id
+    return { mode: 'provider', locked: !overrides, providerAllowOverrides: overrides, provider, defaultModel, models: (group?.models ?? []).filter(m => overrides || m.id === defaultModel) }
   }
 
   const taskShape = {
     task: z.string().describe('交给 Harness 智能体执行的完整任务描述'),
     workspace: z.string().optional().describe('仅当用户明确指定工作区或目录时才传（工作区 id、名称或目录路径）。不要用你自己的当前工作目录填充；不传则使用用户在 Harness 工具栏设置的默认工作区。'),
     sessionId: z.string().optional().describe('继续一个已有会话（来自之前结果的 sessionId）'),
-    model: z.string().optional().describe('模型 id；单模型模式下不可更改，供应商模式下须属于所选供应商'),
-    reasoningEffort: z.string().optional().describe('推理等级 id；单模型模式下不可更改'),
+    provider: z.string().optional().describe('供应商始终由工具栏锁定；通常省略，冲突返回 CONFIG_CONFLICT'),
+    model: z.string().optional().describe('通常省略。仅用户明确要求且工具栏允许选择时填写；后端冲突返回 CONFIG_CONFLICT，不发送模型请求'),
+    reasoningEffort: z.string().optional().describe('通常省略。仅用户明确要求且允许覆盖时填写；不得自行猜测或覆盖右下角配置'),
     title: z.string().optional().describe('新会话标题（自动加 [MCP] 前缀）'),
   }
 
   async function guarded<T>(fn: () => Promise<T>) {
     if (!config.enabled.get()) return failure('DeepSeek Harness MCP 已在 Harness 右下角工具栏关闭')
-    try { return text(await fn()) } catch (error) {
+    try { await ready; if (unloading) throw new Error('BRIDGE_UNLOADING'); return text(await fn()) } catch (error) {
       return failure(error instanceof Error ? error.message : String(error))
     }
   }
 
   function buildServer(): McpServer {
-    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.1.0' })
+    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.0' })
     server.tool('harness_status', '查看 Harness MCP 桥接状态：开关、模式、锁定模型/供应商、默认工作区、自动批准', {}, async () => {
       try { return text(await status()) } catch (error) { return failure(String(error)) }
     })
@@ -995,8 +1157,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       const record = findTask(taskId)
       if (ACTIVE.includes(record.status)) {
         runtimes.get(taskId)?.cancel?.()
-        if (record.status === 'queued') record.status = 'cancelled'
-        taskStore.save()
+        await durable(record)
       }
       return taskView(record)
     }))
@@ -1010,11 +1171,12 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     server.tool('manage_sessions', '批量归档 / 取消归档 / 永久删除某工作区的会话；不带 confirm: true 时只预览', {
       workspace: z.string().describe('工作区 id、名称或路径'),
       action: z.enum(['archive', 'unarchive', 'delete']),
-      mcpOnly: z.boolean().optional().describe('只处理 MCP 创建的会话'),
+      mcpOnly: z.boolean().default(true).describe('默认 true，仅 MCP 会话；显式 false 包含个人会话，必须先预览并确认'),
       olderThanDays: z.number().optional().describe('只处理最后修改早于 N 天的会话'),
       includeArchived: z.boolean().optional().describe('删除时默认包含已归档会话'),
       confirm: z.boolean().optional(),
-    }, ({ workspace, action, confirm, ...filter }) => guarded(() => manageSessions(workspace, action, filter, confirm === true)))
+      previewToken: z.string().optional().describe('永久删除必须使用预览返回的短期令牌，绑定具体 ID 和版本'),
+    }, ({ workspace, action, confirm, previewToken, ...filter }) => guarded(() => manageSessions(workspace, action, filter, confirm === true, previewToken)))
     return server
   }
 
@@ -1028,61 +1190,42 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   const endpointFile = join(dshHome(), 'mcp-bridge', 'endpoint.json')
-  const endpoint: { pipe?: string; http?: string; pid: number } = { pid: process.pid }
+  const endpoint: { pipe?: string; protocol: string; http?: string; pid: number } = { pid: process.pid, protocol: 'tls-psk-v2' }
   const publishEndpoint = async () => {
     await mkdir(join(dshHome(), 'mcp-bridge'), { recursive: true })
     await writeFile(`${endpointFile}.tmp`, JSON.stringify(endpoint, null, 2))
     await rename(`${endpointFile}.tmp`, endpointFile)
   }
 
-  // Primary: local pipe. A client sends one `{"dsh-mcp-bridge-auth": token}` line,
-  // then the socket carries newline-delimited MCP JSON-RPC (stdio framing) for a
-  // long-lived session — no TCP port, no request timeouts.
+  // Standard PSK-only TLS over the local pipe authenticates BOTH peers and
+  // encrypts MCP frames. No certificate fallback and no plaintext-token downgrade.
   ctx.effect(() => {
     const path = config.pipePath || defaultPipePath()
     const sockets = new Set<net.Socket>()
-    const server = net.createServer(socket => {
-      sockets.add(socket)
-      socket.on('close', () => sockets.delete(socket))
+    let key: Buffer
+    const server = tls.createServer({
+      minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2', ciphers: 'PSK-AES256-GCM-SHA384', handshakeTimeout: 10_000,
+      pskCallback: (_socket, identity) => identity === 'dsh-mcp-bridge-v2' ? key : null,
+    }, socket => {
+      socket.pause()
+      const mcp = buildServer()
       socket.on('error', () => socket.destroy())
-      let head = Buffer.alloc(0)
-      const onData = (chunk: Buffer) => { void handshake(Buffer.from(chunk)) }
-      const handshake = async (chunk: Buffer) => {
-        head = Buffer.concat([head, chunk])
-        const newline = head.indexOf(0x0a)
-        if (newline < 0) {
-          if (head.length > 4096) socket.destroy()
-          return
-        }
-        socket.off('data', onData)
-        socket.pause()
-        const rest = head.subarray(newline + 1)
-        try {
-          const given = JSON.parse(head.subarray(0, newline).toString('utf8'))?.[AUTH_KEY]
-          if (typeof given !== 'string' || !tokenMatches(given, await tokenReady)) {
-            socket.end(JSON.stringify({ [AUTH_KEY]: 'unauthorized' }) + '\n')
-            return
-          }
-        } catch {
-          socket.end(JSON.stringify({ [AUTH_KEY]: 'bad handshake' }) + '\n')
-          return
-        }
-        socket.write(JSON.stringify({ [AUTH_KEY]: 'ok' }) + '\n')
-        const mcp = buildServer()
-        const transport = new StdioServerTransport(socket, socket)
-        socket.on('close', () => { void mcp.close() })
-        await mcp.connect(transport)
-        if (rest.length) socket.unshift(rest)
-        socket.resume()
-      }
-      socket.on('data', onData)
+      socket.on('close', () => { void mcp.close() })
+      void mcp.connect(new StdioServerTransport(socket, socket)).then(() => socket.resume()).catch(() => socket.destroy())
     })
+    server.on('connection', raw => {
+      sockets.add(raw)
+      raw.on('close', () => sockets.delete(raw))
+      raw.on('error', () => raw.destroy())
+    })
+    server.on('tlsClientError', (_error, socket) => socket.destroy())
     server.on('error', (error: NodeJS.ErrnoException) => {
       logger.error(error.code === 'EADDRINUSE'
         ? `管道 ${path} 已被占用（是否有另一个 Harness 实例在运行？）`
         : `pipe server error: ${String(error)}`)
     })
     const listen = async () => {
+      key = createHash('sha256').update(await tokenReady).digest()
       if (process.platform !== 'win32') {
         await mkdir(join(path, '..'), { recursive: true })
         // A stale socket file from a crash would block listen(); a live owner still answers connect().
@@ -1102,7 +1245,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         void publishEndpoint().catch(error => logger.warn(`write endpoint failed: ${String(error)}`))
       })
     }
-    void listen()
+    void listen().catch(() => logger.error('PIPE_START_FAILED'))
     return () => {
       for (const socket of sockets) socket.destroy()
       server.close()
@@ -1128,8 +1271,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
         await mcp.connect(transport)
         await transport.handleRequest(req, res)
       } catch (error) {
-        logger.warn(`request failed: ${String(error)}`)
-        if (!res.headersSent) reply(500, String(error))
+        logger.warn('HTTP_REQUEST_FAILED')
+        if (!res.headersSent) reply(500, 'HTTP_REQUEST_FAILED')
       }
     })
     server.on('error', (error: NodeJS.ErrnoException) => {

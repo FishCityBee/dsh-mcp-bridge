@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 const root = fileURLToPath(new URL('.', import.meta.url))
 const out = `${root}dist-package/`
 const PACKAGE = 'dsh-mcp-bridge'
-const VERSION = '0.1.0'
+const VERSION = '0.2.0'
 
 // Shell-shared browser modules (dsh-client-web platform.ts); everything else is inlined.
 const PLATFORM_MODULES = [
@@ -57,7 +57,7 @@ await writeFile(`${out}package.json`, JSON.stringify({
     './client': './lib/client.js',
     './package.json': './package.json',
   },
-  engines: { dsh: '>=0.2.0-0 <0.3.0' },
+  engines: { dsh: '0.2.1-rc.2' },
   dsh: {
     bundle: { patch: './cordis.patch.yml' },
     client: {
@@ -72,9 +72,10 @@ await writeFile(`${out}package.json`, JSON.stringify({
   peerDependencies: {
     '@deepseek-ai/cordis': '*',
     '@deepseek-ai/schemastery': '*',
-    '@deepseek-ai/dsh-llm': '*',
-    '@deepseek-ai/dsh-session': '*',
-    '@deepseek-ai/dsh-user-approval': '*',
+    '@deepseek-ai/dsh-agent': '0.2.1-rc.2',
+    '@deepseek-ai/dsh-llm': '0.2.1-rc.2',
+    '@deepseek-ai/dsh-session': '0.2.1-rc.2',
+    '@deepseek-ai/dsh-user-approval': '0.2.1-rc.2',
   },
   license: 'MIT',
 }, null, 2) + '\n')

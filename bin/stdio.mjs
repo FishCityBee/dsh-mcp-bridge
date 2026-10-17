@@ -4,11 +4,12 @@
 //
 // Env overrides: DSH_HOME, DSH_MCP_BRIDGE_PIPE, DSH_MCP_BRIDGE_TOKEN, DSH_MCP_BRIDGE_WAIT_MS.
 import net from 'node:net'
+import tls from 'node:tls'
+import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { homedir, userInfo } from 'node:os'
 import { join } from 'node:path'
 
-const AUTH_KEY = 'dsh-mcp-bridge-auth'
 const home = process.env.DSH_HOME || join(homedir(), '.dsh')
 const waitMs = Number(process.env.DSH_MCP_BRIDGE_WAIT_MS ?? 15000)
 
@@ -60,23 +61,23 @@ try {
   fail(`连不上 DeepSeek Harness（${path}）：${error.code ?? error.message}。请确认 Harness 桌面端已启动且 dsh-mcp-bridge 插件已加载。`)
 }
 
-socket.write(JSON.stringify({ [AUTH_KEY]: secret }) + '\n')
-
-let head = Buffer.alloc(0)
-socket.on('data', function onHandshake(chunk) {
-  head = Buffer.concat([head, chunk])
-  const newline = head.indexOf(0x0a)
-  if (newline < 0) return
-  socket.off('data', onHandshake)
-  let verdict
-  try { verdict = JSON.parse(head.subarray(0, newline).toString('utf8'))[AUTH_KEY] } catch { verdict = 'bad reply' }
-  if (verdict !== 'ok') fail(`握手失败：${verdict}`)
-  const rest = head.subarray(newline + 1)
-  if (rest.length) process.stdout.write(rest)
+// A PSK-only cipher cannot fall back to an unauthenticated certificate.
+// The long-term token is a key input only; it is never put on the wire.
+const raw = socket
+socket = tls.connect({
+  socket: raw, minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2',
+  ciphers: 'PSK-AES256-GCM-SHA384', rejectUnauthorized: false,
+  pskCallback: () => ({ identity: 'dsh-mcp-bridge-v2', psk: createHash('sha256').update(secret).digest() }),
+})
+let secure = false
+const handshakeTimeout = setTimeout(() => fail('管道身份认证超时；请同时更新插件与中转脚本'), 10_000)
+socket.once('secureConnect', () => {
+  secure = true
+  clearTimeout(handshakeTimeout)
   socket.pipe(process.stdout)
   process.stdin.pipe(socket)
 })
 
 socket.on('error', error => fail(`连接错误：${error.message}`))
-socket.on('close', () => process.exit(0))
+socket.on('close', () => { clearTimeout(handshakeTimeout); process.exit(secure ? 0 : 1) })
 process.stdin.on('end', () => socket.end())

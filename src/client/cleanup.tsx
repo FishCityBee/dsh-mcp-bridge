@@ -10,6 +10,7 @@ export interface CleanupCommand {
   manageAction: BatchAction
   filter: BatchFilter
   confirm: boolean
+  previewToken?: string
 }
 
 interface WorkspaceRow { workspaceId: string; title: string; path: string }
@@ -58,7 +59,7 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
       const more = targets.length > 8 ? `\n…等共 ${targets.length} 个` : ''
       const warning = action === 'delete' ? '\n\n永久删除后无法恢复。' : ''
       if (!window.confirm(`在「${targetTitle}」中${ACTION_LABEL[action]} ${targets.length} 个会话：\n\n${names}${more}${warning}`)) return
-      const result = await sendCommand({ action: 'manage-sessions', workspace: target, manageAction: action, filter, confirm: true })
+      const result = await sendCommand({ action: 'manage-sessions', workspace: target, manageAction: action, filter, confirm: true, previewToken: preview.previewToken })
       setNotice(`已${ACTION_LABEL[action]} ${result.done} 个会话${result.failed ? `，${result.failed} 个失败` : ''}`)
     } catch (error) {
       setNotice(message(error))

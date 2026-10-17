@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Drive DeepSeek Harness desktop agents from Claude Code (or any MCP client) over a local pipe, with an in-app toolbar for model, provider, workspace and session cleanup.",
   "private": true,
   "type": "module",
@@ -12,7 +12,10 @@
   "scripts": {
     "build": "node build.mjs",
     "typecheck": "tsc -p .",
-    "test": "node build.mjs && node tests/smoke.mjs"
+    "test": "node build.mjs && node tests/smoke.mjs && node tests/units.mjs && node tests/regression.mjs && node tests/pipe-security.mjs",
+    "test:regression": "node tests/regression.mjs",
+    "test:units": "node tests/units.mjs",
+    "test:pipe": "node tests/pipe-security.mjs"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.5",
