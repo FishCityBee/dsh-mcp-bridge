@@ -20,10 +20,17 @@
   - 可以设置默认工作区：调用方没明确指定时，会话就建在这里。
   - **新建 MCP 会话权限**：与对话框一致，选择“仅可查看 / 工作区访问 / 完全权限”，同时应用沙箱范围与审批策略；也可使用 Harness 新会话默认值。续聊和恢复保留各自会话的权限。
   - **会话清理**：
-    - 自动删除超过 N 天的 MCP 会话；
-    - 按工作区批量归档、取消归档、永久删除，默认只处理 MCP 创建的会话，执行前会弹窗确认。
-- **会话菜单**：每个会话的「…」菜单里增加「删除会话」（永久删除；需要保留请用 Harness 自带的归档）。
+    - 永久删除和自动清理已停用：当前 Harness 没有跨进程安全删除接口；历史天数仅保留显示，不触发删除；
+    - 按工作区批量归档、取消归档，默认只处理 MCP 创建的会话，执行前会弹窗确认。
+- **会话菜单**：永久删除入口显示为不可用；请使用 Harness 自带的归档。旧 pending 删除记录保留但不会执行，关闭 MCP 也不会启动删除。
 - 设置用于下一任务；排队任务启动前重新核对，已经运行的任务保留启动快照。修改这些设置不会重启插件。
+
+## 0.2.3 复审修复
+
+永久删除的四条执行路径全部停用，避免误删其他进程正在写入的会话；归档和只读预览继续可用。任务结果同时处理官方 `droppedUnrun`，外部取消未运行输入会记为 `cancelled`，并保留此前的消费终止原因。成功写盘的快照记录 `durable`，冷恢复清除旧进程的瞬时 `pending/degraded` 标记；写入失败仍明确报告降级。
+
+逐项结论、实际测试与平台边界见 [0.2.3 复审修复记录](docs/recheck-0.2.3.md)。
+
 
 ## 0.2.2 新会话权限
 
@@ -47,13 +54,13 @@ MCP 启用、允许调用方覆盖、清理范围这三个勾选项均改为开�
 - 回执分别提供 `requestedSelection`、`effectiveSelection`、`configVersion` 和 `configSource`。版本是无密钥配置内容指纹；有效值仅在官方 `llm/stream` 看到真实请求信封后填写，否则为 `null`，不等于证明供应商收到了请求或计费。旧的 provider/model 字段为任务约束，供旧 MCP 客户端兼容。
 - 旧 `autoApprove` 不再作为授权来源；原来错误的 `never` 实际是自动拒绝。新 `approvalMode` 默认 `inherit`，已有会话保留原策略；明确选择 ask/never 仅用于本插件管理的会话。不会把单次允许记忆为持续授权，也不复制其他会话的权限。
 - 0.2.1-rc.2 只有 `ask/never` 和 `allowed-once/rejected/cancelled/unavailable`。需要同范围持续授权时必须先有上游支持的范围机制；本次没有自建放行缓存、切换全局沙箱或实施永久授权。Claude 的 MCP 工具许可、Harness 的审批/沙箱、Auto review 与操作系统提示是不同层；桥接日志只报告它可观察到的层。
-- 批量永久删除需先预览，再在 60 秒内提交原 `previewToken` 与 `confirm:true`；令牌固定具体 ID 和版本。包含个人会话必须显式 `mcpOnly:false`。会话变化需重新确认，新出现的匹配会话不会被加入原确认。
+- 批量操作可先预览，再于 60 秒内提交原 `previewToken` 与 `confirm:true`；令牌固定具体 ID 和版本。包含个人会话必须显式 `mcpOnly:false` 并确认。`delete` 仅可预览，执行明确返回 `PERMANENT_DELETE_UNSUPPORTED`。
 
 逐项证据、修改文件和桌面手工验收步骤见 [本次修复报告](docs/audit-2026-10-17.md)。
 
 ## 安装
 
-需要：DeepSeek Harness 桌面端 **0.2.1-rc.2**、Node.js 22+。当前版本为 **0.2.2**，未验证其他 Harness 版本。0.2.1 修复了 0.2.0 的 OpenSSL PSK 密码套件在桌面 Electron / BoringSSL 中不可用的问题。
+需要：DeepSeek Harness 桌面端 **0.2.1-rc.2**、Node.js 22+。当前版本为 **0.2.3**，未验证其他 Harness 版本。0.2.1 已修复旧传输在 Electron / BoringSSL 中不可用的问题。
 
 ```bash
 git clone https://github.com/FishCityBee/dsh-mcp-bridge.git
@@ -94,8 +101,8 @@ claude mcp add-json dsh-harness -s user '{"type":"stdio","command":"node","args"
 | `run_task` | 执行任务，阻塞到完成，期间发送进度。参数：`task`、`workspace?`、`sessionId?`、`provider?`、`model?`、`reasoningEffort?`、`title?` |
 | `start_task` / `wait_task` | 后台启动 / 阻塞等待（可设上限，到时只返回进度，不会取消任务） |
 | `get_task` / `list_tasks` / `cancel_task` | 查看任务状态、找回任务、取消任务 |
-| `delete_session` | 永久删除会话（需要 `confirm: true`） |
-| `manage_sessions` | 按工作区批量归档、取消归档、永久删除；默认 `mcpOnly:true`，删除需携带预览返回的 `previewToken` |
+| `delete_session` | 只读预览；确认执行时返回 `PERMANENT_DELETE_UNSUPPORTED`，不删除、不归档、不创建 pending |
+| `manage_sessions` | 批量归档、取消归档，默认 `mcpOnly:true`；`delete` 仅可预览，永久删除执行不可用 |
 
 只有用户明确指定时，才需要传 `workspace` 参数（工作区 id、名称或目录路径都可以）；不传就用工具栏里设置的默认工作区。
 
@@ -111,7 +118,7 @@ claude mcp add-json dsh-harness -s user '{"type":"stdio","command":"node","args"
 - **前端怎么调用后端**：没有自定义 RPC，复用设置通道。
   - 工具栏把 JSON 命令写进 `command` 字段，后端执行后把结果写到 `commandResult`。
   - 后端回写时必须先用 `hmr.executing.exit()` 退出工具栏那次写入的 HMR 事务上下文，否则会报 `HMR transactions cannot be nested`。
-- **删除会话**：先检查合法 ID、官方持久化身份、配置的 JSONL 存储根、每层真实路径与链接；默认仅支持 `$DSH_HOME/sessions`，其他根明确拒绝。对另一 owner 仍持有的 live 会话先归档停止并排队，释放后重新验证 ID 与日志版本再删除。旧队列中的绝对路径不再执行，需要重新确认。当前有效最高代日志文件的时间用于自动及批量过期判断；目录 mtime 不代表活动。
+- **删除会话**：0.2.3 禁止手动、批量、自动和 pending 路径实际删除文件，也不因删除请求停止或分离会话。官方 `stat/revision` 只观察日志，不代表没有其他进程持有写租约；取得写租约再递归删除也不足以阻止新 owner。需要官方原子删除或等效存储协议后才能重新启用。ID、真实路径、日志时间和确认版本边界继续保留；存储根使用平台正确的规范路径及文件身份核对。
 
 ## 数据文件
 
@@ -120,13 +127,13 @@ claude mcp add-json dsh-harness -s user '{"type":"stdio","command":"node","args"
 - `bridge.log`：插件日志（桌面端本身不会把插件日志写到磁盘）
 - `tasks.json`：全部活动任务 + 最近 7 天最多 200 条终态历史；接纳与终态等待同步写入，失败显式报告
 - `sessions.json`：由 MCP 创建的会话
-- `pending-deletes.json`：等待 owner 释放后校验删除的具体 ID / 日志版本，不存可信删除路径
+- `pending-deletes.json`：旧待删除记录；0.2.3 原样保留但不执行、不新增，启动时只报告已禁用
 - `endpoint.json`：管道地址
 
 ## 已知限制
 
 - 依赖 Harness 的内部接口（比如 `hmr.executing`、会话目录结构），Harness 升级后可能需要适配。
-- 当前正在界面里打开的会话，删除后它在本次运行期间仍留在内存里，直到 Harness 重启。
+- 永久删除暂不可用；归档保留磁盘数据。不能把归档描述为跨进程原子删除，也不能保证通过归档停止另一个 CLI/SDK 进程。
 - 没有找到 Harness 推送进度的通道，所以在 Claude Code 里显示进度依赖 MCP 的 progress 通知（要求客户端提供 progressToken）。
 
 ## 开发
@@ -134,7 +141,7 @@ claude mcp add-json dsh-harness -s user '{"type":"stdio","command":"node","args"
 ```bash
 npm run typecheck
 npm run build
-npm test        # 构建 + smoke + 单元 + 回归 + 真实临时管道安全测试；不访问真实会话或模型
+npm test        # 构建 + smoke + 单元 + 回归 + 临时管道测试 + 复审回归；不访问真实会话或模型
 ```
 
 用 `node scripts/tools.mjs` 和 `node scripts/call.mjs <tool> '<json>'` 可以直接调用正在运行的 Harness。

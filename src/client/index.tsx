@@ -230,18 +230,10 @@ interface DeleteMenuProps {
   sendCommand: SendCommand
 }
 
-function DeleteSessionMenuItem({ sessionId, displayTitle, useMenuOpenState, sendCommand }: DeleteMenuProps) {
-  const [, setMenuOpen] = useMenuOpenState()
+function DeleteSessionMenuItem(_props: DeleteMenuProps) {
   return (
-    <MenuItemButton danger separatorBefore icon={<IconTrashOutlineRegular />} onSelect={() => {
-      setMenuOpen(false)
-      const label = displayTitle || sessionId
-      if (!window.confirm(`永久删除会话「${label}」？\n\n删除后无法恢复。只想先收起来的话，请用菜单里的「归档」。`)) return
-      sendCommand({ action: 'delete-session', sessionId }).catch(error => {
-        window.alert(`删除失败：${message(error)}`)
-      })
-    }}>
-      删除会话
+    <MenuItemButton disabled separatorBefore icon={<IconTrashOutlineRegular />} onSelect={() => {}}>
+      永久删除暂不可用，请用归档
     </MenuItemButton>
   )
 }

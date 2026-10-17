@@ -47,7 +47,7 @@ export interface StoredTask {
   selectionEvidence?: 'llm/stream'
   requestCount?: number
   eventBaseline?: number
-  termination?: { kind: string; error?: { code: string; message: string }; reason?: { kind: string } }
+  termination?: { kind: string; error?: { code: string; message: string }; reason?: { kind: string }; droppedUnrun?: boolean; consumedEnd?: { kind: string } }
   approval?: { mode: string; source: string; preset?: string; sandbox?: string; persistentGrants: false }
   approvalDiagnostics?: { tool: string; outcome?: string; reason: string }[]
   durability?: 'pending' | 'durable' | 'degraded'
@@ -76,7 +76,9 @@ export class TaskStore {
     this.loading ??= (async () => {
       const list = await readJson<StoredTask[]>(this.path, () => [])
       if (!Array.isArray(list) || list.some(r => !r || typeof r.id !== 'string' || typeof r.status !== 'string')) throw new Error('STORAGE_READ_FAILED: invalid task records')
-      for (const record of list) this.records.set(record.id, record)
+      // An on-disk record is the acknowledged snapshot, even if an old process
+      // serialized a transient pending/degraded marker before its write settled.
+      for (const record of list) this.records.set(record.id, { ...record, durability: 'durable', persistenceError: undefined })
     })()
     return this.loading
   }
@@ -104,6 +106,8 @@ export class TaskStore {
     const kept = [...active, ...history]
     this.records.clear()
     for (const record of kept) this.records.set(record.id, record)
-    return this.writer.write(kept)
+    // Encode the successful target state without claiming it in live memory.
+    // The snapshot is published only by JsonWriter's successful atomic rename.
+    return this.writer.write(kept.map(record => ({ ...record, durability: 'durable', persistenceError: undefined })))
   }
 }

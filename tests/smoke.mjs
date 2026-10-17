@@ -14,6 +14,9 @@ process.env.DSH_HOME = home
 process.env.DSH_MCP_BRIDGE_PROGRESS_MS = '200'
 process.env.DSH_MCP_BRIDGE_MONITOR_MS = '100'
 await writeFile(join(home, 'harness-mcp-token.txt'), 'test-token\n')
+// The fixture declares this as its backend root. Materialize it so the real
+// canonical-path/file-identity guard can validate that declaration.
+await mkdir(join(home, 'sessions'))
 const pipe = process.platform === 'win32' ? `\\\\.\\pipe\\dmb-smoke-${process.pid}` : join(home, 'smoke.sock')
 
 const { apply } = await import(`file://${root}dist-package/lib/index.js`)
@@ -265,8 +268,10 @@ check('list_sessions shows MCP sessions', r.body.sessions.length >= 5 && r.body.
 const victim = workspace.sessionIds[0]
 const victimDir = await sessionDir(victim)
 r = await call('delete_session', { sessionId: victim, confirm: true })
-check('delete_session removes files permanently',
-  !r.isError && r.body.deleted === victim && !(await exists(victimDir)) && !(await exists(join(home, 'mcp-bridge-trash'))), r)
+// 0.2.3 deliberately removes the unsafe permanent-delete contract. Preserve
+// the old fixture and assert refusal plus data retention instead of dropping it.
+check('delete_session refuses permanent removal and preserves files and membership',
+  r.isError && String(r.body).includes('PERMANENT_DELETE_UNSUPPORTED') && await exists(victimDir) && workspace.sessionIds.includes(victim), r)
 
 // A session the Harness UI has open (resident agent this plugin does not own).
 const residentId = 'session-resident'
@@ -274,9 +279,8 @@ workspace.sessionIds.push(residentId)
 const residentDir = await sessionDir(residentId)
 ctx.agents.live.set(residentId, { session: { header: { id: residentId, cwd: workdir } }, whenIdle: async () => {} })
 r = await call('delete_session', { sessionId: residentId, confirm: true })
-// Another owner may retain a writer after idle: queue instead of deleting under it.
-check('resident session: stopped, detached, files safely queued for owner release',
-  !r.isError && archived.includes(residentId) && !workspace.sessionIds.includes(residentId) && await exists(residentDir) && !!r.body.note, r)
+check('resident session is preserved without stopping, detaching or queuing',
+  r.isError && String(r.body).includes('PERMANENT_DELETE_UNSUPPORTED') && !archived.includes(residentId) && workspace.sessionIds.includes(residentId) && await exists(residentDir), r)
 ctx.agents.live.delete(residentId)
 
 // ---- toolbar mailbox (also without volatile-update events: host polls) ------------
@@ -296,7 +300,7 @@ fireVolatileEvents = false
 const target = workspace.sessionIds.at(-1)
 await sessionDir(target)
 reply = await mailbox({ action: 'delete-session', sessionId: target })
-check('mailbox works without volatile events (1s poll)', reply.ok && !workspace.sessionIds.includes(target), reply)
+check('mailbox refuses deletion even without volatile events (1s poll)', !reply.ok && reply.error.includes('PERMANENT_DELETE_UNSUPPORTED') && workspace.sessionIds.includes(target), reply)
 fireVolatileEvents = true
 await ctx.settings.update('mcp-bridge', { command: JSON.stringify({ id: 'stale', at: Date.now() - 120_000, action: 'delete-session', sessionId: workspace.sessionIds[0] }) })
 await sleep(200)
@@ -315,10 +319,9 @@ ctx.agents.live.delete(oldId)
 const freshId = workspace.sessionIds[1]
 await sessionDir(freshId)
 await ctx.settings.update('mcp-bridge', { autoCleanupDays: 7 })
-for (let i = 0; i < 100 && !values.cleanupStatus; i++) await sleep(30)
-const cleanup = values.cleanupStatus && JSON.parse(values.cleanupStatus)
-check('auto cleanup deletes only old MCP sessions',
-  cleanup?.deleted === 1 && !workspace.sessionIds.includes(oldId) && workspace.sessionIds.includes(freshId), { cleanup })
+reply = await mailbox({ action: 'cleanup-now' })
+check('auto cleanup refuses deletion despite a legacy enabled setting',
+  !reply.ok && reply.error.includes('PERMANENT_DELETE_UNSUPPORTED') && workspace.sessionIds.includes(oldId) && workspace.sessionIds.includes(freshId) && await exists(oldDir), reply)
 
 // ---- switch -------------------------------------------------------------------------
 values.enabled = false

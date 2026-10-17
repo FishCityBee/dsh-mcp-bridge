@@ -1,5 +1,6 @@
 /** Toolbar "会话清理" section: auto-cleanup days plus one-button batch archive / unarchive / delete. */
 import { useState } from 'react'
+import { PERMANENT_DELETE_MESSAGE, PERMANENT_DELETE_SUPPORTED } from '../deletion.ts'
 
 export type BatchAction = 'archive' | 'unarchive' | 'delete'
 export interface BatchFilter { mcpOnly?: boolean; olderThanDays?: number }
@@ -46,6 +47,10 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
 
   /** Ask the host which sessions match, confirm with the user, then run. */
   const run = async () => {
+    if (action === 'delete' && !PERMANENT_DELETE_SUPPORTED) {
+      setNotice(PERMANENT_DELETE_MESSAGE)
+      return
+    }
     setBusy(true)
     setNotice(null)
     try {
@@ -78,10 +83,11 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
         <div className="dmb-section-body">
           <label className="dmb-field dmb-inline">
             <span>自动删除早于</span>
-            <input type="number" min={0} className="dmb-num" value={autoCleanupDays ?? 0} disabled={!saveDays}
+            <input type="number" min={0} className="dmb-num" value={autoCleanupDays ?? 0} disabled={!saveDays || !PERMANENT_DELETE_SUPPORTED}
               onChange={e => saveDays?.(Math.max(0, Math.floor(Number(e.target.value) || 0)))} />
             <span>天的 MCP 会话（0 为关闭）</span>
           </label>
+          <p className="dmb-note">永久删除和自动清理已停用：当前 Harness 不支持跨进程安全删除。请使用归档；旧待删除记录保留但不会执行。上方天数仅显示历史设置。</p>
           {cleanup && (
             <p className="dmb-note">
               上次自动清理：{new Date(cleanup.at).toLocaleString()}，删除 {cleanup.deleted} 个{cleanup.failed.length ? `，${cleanup.failed.length} 个失败` : ''}
@@ -100,7 +106,7 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
             <select className="dmb-grow" value={action} onChange={e => { setAction(e.target.value as BatchAction); setNotice(null) }}>
               <option value="archive">归档</option>
               <option value="unarchive">取消归档</option>
-              <option value="delete">永久删除</option>
+              <option value="delete" disabled={!PERMANENT_DELETE_SUPPORTED}>永久删除（暂不可用）</option>
             </select>
             <input type="number" min={0} placeholder="早于 N 天" className="dmb-num" value={olderThan}
               onChange={e => { setOlderThan(e.target.value); setNotice(null) }} />
@@ -111,7 +117,7 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
           </label>
           {notice && <p className="dmb-note">{notice}</p>}
           <button type="button" className={action === 'delete' ? 'dmb-btn dmb-btn-danger' : 'dmb-btn dmb-btn-primary'}
-            disabled={busy || !target} onClick={() => void run()}>
+            disabled={busy || !target || (action === 'delete' && !PERMANENT_DELETE_SUPPORTED)} onClick={() => void run()}>
             {busy ? '处理中…' : `${ACTION_LABEL[action]}符合条件的会话…`}
           </button>
         </div>

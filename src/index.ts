@@ -33,7 +33,9 @@ import { ACTIVE, TaskStore, type StoredTask, type TaskProgress } from './tasks.t
 import { configVersion, sameSelection, select, type Selection, type SelectionSettings } from './selection.ts'
 import { Semaphore } from './scheduler.ts'
 import { SessionFiles, validateSessionId } from './session-files.ts'
-import { JsonWriter, readJson } from './persistence.ts'
+import { readJson } from './persistence.ts'
+import { samePath } from './paths.ts'
+import { PERMANENT_DELETE_SUPPORTED, PERMANENT_DELETE_MESSAGE, refusePermanentDelete } from './deletion.ts'
 
 export const name = 'mcp-bridge'
 export const inject = ['llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'permissionPresets']
@@ -151,12 +153,6 @@ function text(value: unknown) {
 function failure(message: string) {
   return { content: [{ type: 'text' as const, text: message }], isError: true }
 }
-
-function samePath(a: string, b: string): boolean {
-  const norm = (p: string) => resolve(p).replace(/[\\/]+$/, '').toLowerCase()
-  return norm(a) === norm(b)
-}
-
 async function loadToken(file: string, logger: BridgeLogger): Promise<string> {
   const path = file || join(dshHome(), 'harness-mcp-token.txt')
   try {
@@ -543,9 +539,13 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       sample(record, agent, state)
       record.result = summarize(agent.session.deriveMessages().slice(record.baseline ?? 0))
       const events = agent.session.snapshotEvents(record.eventBaseline ?? 0)
-      const reason = foldConsumedWork(events).end?.data.reason
-      record.termination = reason ?? { kind: 'missing-turn-end' }
+      const consumed = foldConsumedWork(events)
+      const reason = consumed.end?.data.reason
+      record.termination = consumed.droppedUnrun
+        ? { kind: 'dropped-unrun', droppedUnrun: true, ...(reason ? { consumedEnd: reason } : {}) }
+        : reason ?? { kind: 'missing-turn-end' }
       if (signal.aborted || record.status === 'cancelled') record.status = 'cancelled'
+      else if (consumed.droppedUnrun) record.status = 'cancelled'
       else if (reason?.kind === 'completed') record.status = 'done'
       else if (reason?.kind === 'aborted') record.status = reason.reason.kind === 'disposed' ? 'interrupted' : 'cancelled'
       else if (reason?.kind === 'error' || reason?.kind === 'blocked' || reason?.kind === 'max-tokens') {
@@ -739,17 +739,26 @@ export function apply(ctx: Context, config: BridgeConfig): void {
 
   // ---- workspaces & sessions ----------------------------------------------
 
-  function requireStorageRoot() {
+  async function requireStorageRoot() {
     // This pinned backend exposes its configured root as a JS data property.
     // Use it only as a refusal guard, never as a caller-controlled delete target.
     const root = c.sessionPersistence.root
-    if (typeof root !== 'string' || !samePath(root, join(dshHome(), 'sessions'))) throw new Error('UNSUPPORTED_SESSION_STORAGE: 仅支持已核对的 $DSH_HOME/sessions JSONL 存储根')
+    const refuse = () => { throw new Error('UNSUPPORTED_SESSION_STORAGE: 仅支持已核对的 $DSH_HOME/sessions JSONL 存储根') }
+    if (typeof root !== 'string') return refuse()
+    try {
+      const expected = await files.safe(['sessions'])
+      if (!expected) return refuse()
+      const actual = await realpath(root)
+      if (!samePath(actual, expected)) return refuse()
+      const [left, right] = await Promise.all([stat(actual, { bigint: true }), stat(expected, { bigint: true })])
+      if (!left.isDirectory() || left.dev !== right.dev || left.ino !== right.ino) return refuse()
+    } catch { return refuse() }
   }
 
   async function requireSession(id: string, destructive = true) {
     validateSessionId(id)
     // Validate all destructive roots before asking the official reader to verify identity.
-    if (destructive) { requireStorageRoot(); await files.directory(id); await files.cache(id) }
+    if (destructive) { await requireStorageRoot(); await files.directory(id); await files.cache(id) }
     const snapshot = await c.sessionPersistence.stat(SessionId(id))
     const live = c.agents.get(SessionId(id))
     if (snapshot?.header?.id !== id && live?.session?.header?.id !== id) throw new Error('SESSION_NOT_FOUND: 无法验证真实会话')
@@ -766,7 +775,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   async function describeSession(id: string) {
-    requireStorageRoot()
+    await requireStorageRoot()
     const reg = registry()
     validateSessionId(id)
     const activity = await files.activity(id)
@@ -791,88 +800,29 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     return { workspace: { id: workspace.id, title: workspace.title, path: workspace.path }, sessions: rows.filter(r => includeArchived || !r.archived) }
   }
 
-  // ---- permanent deletion ------------------------------------------------------
-  //
-  // Deletion is final (recovery is what Harness's own archive is for). A
-  // session still resident in Harness (opened in the UI) is archived with
-  // stopActivity first, which stops its work and gates further wakes. Files a
-  // live handle still holds are queued and removed on the next start.
-
+  // ---- permanent deletion: unavailable in this pinned storage contract ----
+  // stat/revision do not acquire ownership. A lease plus deleting its lock inode
+  // does not fence new writers. Keep pending records unchanged; never drain them.
   const pendingDeletesFile = join(dshHome(), 'mcp-bridge', 'pending-deletes.json')
-  interface PendingDelete { id: string; version?: string; directory?: string }
-  const pendingWriter = new JsonWriter(pendingDeletesFile)
-  let deleteQueue = Promise.resolve()
-  const readPending = () => readJson<PendingDelete[]>(pendingDeletesFile, () => [])
-  async function updatePending(update: (items: PendingDelete[]) => PendingDelete[]) {
-    const operation = deleteQueue.catch(() => undefined).then(async () => {
-      const items = await readPending()
-      if (!Array.isArray(items)) throw new Error('INVALID_PENDING_DELETES')
-      await pendingWriter.write(update(items))
-    })
-    deleteQueue = operation
-    return operation
-  }
-
+  const readPending = () => readJson<unknown[]>(pendingDeletesFile, () => [])
   async function deleteSession(id: string, expectedVersion?: string): Promise<{ deleted: string; note?: string }> {
     validateSessionId(id)
-    if (busySessions().has(id)) throw new Error('SESSION_BUSY: 会话仍有 MCP 任务或取消尚未完成')
+    if (busySessions().has(id)) throw new Error('SESSION_BUSY')
     return withSessionLock(id, async () => {
       await requireSession(id)
-      if (expectedVersion !== undefined && (await describeSession(id)).version !== expectedVersion) throw new Error('SESSION_CHANGED: 预览后会话已改变，请重新确认')
-      const fileVersion = (await files.activity(id)).version
-      if (busySessions().has(id)) throw new Error('SESSION_BUSY: 会话仍有 MCP 任务或取消尚未完成')
-      const sid = SessionId(id)
-      const reg = registry()
-      const handle = owned.get(id)
-      if (handle) { await handle.dispose(); owned.delete(id) }
-      const resident = c.agents.get(sid)
-      if (resident) {
-        await reg.archiveSession(sid, { stopActivity: true })
-        // Another owner can still hold a persistence writer after idle. Keep files
-        // until that owner has gone; never dispose its handle or delete under it.
-        const version = (await files.activity(id)).version
-        await updatePending(items => [...items.filter(p => p.id !== id), { id, version }])
-      } else {
-        // Revalidate cache/junctions BEFORE removing any session files.
-        await requireSession(id)
-        if (expectedVersion !== undefined && (await files.activity(id)).version !== fileVersion) throw new Error('SESSION_CHANGED: owner 释放期间日志已改变，请重新确认')
-        await files.cache(id)
-        await files.remove(id)
-      }
-      for (const workspace of reg.list().filter(w => w.sessionIds.map(String).includes(id))) await workspace.detachSession?.(sid)
-      if (reg.pinnedSessionIds.map(String).includes(id)) await reg.unpinSession(sid)
-      if (!resident && reg.archivedSessionIds.map(String).includes(id)) await reg.unarchiveSession(sid)
-      if (!resident) await ledger.remove(id)
-      logger.info(JSON.stringify({ event: 'session-delete', sessionId: id, pending: !!resident }))
-      return { deleted: id, ...(resident ? { note: '会话已停止并从列表移除；其他 owner 释放文件后再安全删除。若文件改变将要求重新确认。' } : {}) }
+      if (expectedVersion !== undefined && (await describeSession(id)).version !== expectedVersion) throw new Error('SESSION_CHANGED')
+      return refusePermanentDelete()
     })
   }
-
-  async function finishPendingDeletes() {
-    await ready
-    const pending = await readPending()
-    if (!Array.isArray(pending)) throw new Error('INVALID_PENDING_DELETES')
-    for (const item of pending) {
-      try {
-        validateSessionId(item.id)
-        if (!item.version || item.directory) throw new Error('LEGACY_PENDING_DELETE_REQUIRES_CONFIRMATION')
-        if (c.agents.get(SessionId(item.id)) || busySessions().has(item.id)) continue
-        await withSessionLock(item.id, async () => {
-          await requireSession(item.id)
-          if ((await files.activity(item.id)).version !== item.version) throw new Error('SESSION_CHANGED')
-          await files.cache(item.id)
-          await files.remove(item.id)
-          await ledger.remove(item.id)
-          if (registry().archivedSessionIds.map(String).includes(item.id)) await registry().unarchiveSession(SessionId(item.id))
-          await updatePending(items => items.filter(p => p.id !== item.id))
-        })
-      } catch { logger.warn('pending delete refused: invalid boundary, changed files, or legacy confirmation required') }
-    }
-  }
   ctx.effect(() => {
-    const timer = setTimeout(() => { void finishPendingDeletes().catch(() => logger.warn('pending deletes failed')) }, 5_000)
+    const timer = setTimeout(() => {
+      void ready.then(readPending).then(items => {
+        if (!Array.isArray(items)) throw new Error('INVALID_PENDING_DELETES')
+        if (items.length) logger.warn('PERMANENT_DELETE_UNSUPPORTED: pending records retained; no deletion attempted')
+      }).catch(() => logger.warn('pending records unreadable; permanent deletion remains disabled'))
+    }, 5_000)
     return () => clearTimeout(timer)
-  }, 'mcp-bridge: pending deletes')
+  }, 'mcp-bridge: pending diagnostics only')
 
   type BatchAction = 'archive' | 'unarchive' | 'delete'
   interface BatchFilter { mcpOnly?: boolean; olderThanDays?: number; includeArchived?: boolean }
@@ -894,7 +844,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       if (previews.size >= 500) throw new Error('PREVIEW_LIMIT: 请稍后重试')
       const token = randomBytes(24).toString('hex')
       previews.set(token, { expires: Date.now() + 60_000, workspace: workspace.id, action, mcpOnly, targets })
-      return { workspace, action, dryRun: true, mcpOnly, count: targets.length, targets, previewToken: token, expiresInSec: 60, hint: '确认这些具体 ID 后携带 previewToken 与 confirm: true；mcpOnly:false 明确包含个人会话' }
+      return { workspace, action, dryRun: true, supported: action !== 'delete', mcpOnly, count: targets.length, targets, previewToken: token, expiresInSec: 60, hint: action === 'delete' ? PERMANENT_DELETE_MESSAGE : '确认这些具体 ID 后携带 previewToken 与 confirm: true；mcpOnly:false 明确包含个人会话' }
     }
     if (previewToken) {
       const preview = previews.get(previewToken)
@@ -903,40 +853,25 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       for (const target of targets) if ((await describeSession(target.sessionId)).version !== target.version) throw new Error('SESSION_CHANGED: 预览后会话发生变化，请重新确认')
       previews.delete(previewToken)
     } else if (action === 'delete' || !mcpOnly) throw new Error('CONFIRMATION_REQUIRED: 永久删除或包含个人会话必须携带预览令牌')
+    if (action === 'delete') refusePermanentDelete()
     const results: { sessionId: string; ok: boolean; detail?: string }[] = []
     for (const target of targets) {
       try {
-        if (action === 'delete') results.push({ sessionId: target.sessionId, ok: true, detail: (await deleteSession(target.sessionId, target.version)).note })
-        else {
-          await withSessionLock(target.sessionId, async () => {
-            await requireSession(target.sessionId)
-            if (busySessions().has(target.sessionId)) throw new Error('SESSION_BUSY')
-            if (action === 'archive') await registry().archiveSession(SessionId(target.sessionId), { stopActivity: true })
-            else await registry().unarchiveSession(SessionId(target.sessionId))
-          })
-          results.push({ sessionId: target.sessionId, ok: true })
-        }
+        await withSessionLock(target.sessionId, async () => {
+          await requireSession(target.sessionId)
+          if (busySessions().has(target.sessionId)) throw new Error('SESSION_BUSY')
+          if (action === 'archive') await registry().archiveSession(SessionId(target.sessionId), { stopActivity: true })
+          else await registry().unarchiveSession(SessionId(target.sessionId))
+        })
+        results.push({ sessionId: target.sessionId, ok: true })
       } catch (error) { results.push({ sessionId: target.sessionId, ok: false, detail: error instanceof Error ? error.message : String(error) }) }
     }
     return { workspace, action, done: results.filter(r => r.ok).length, failed: results.filter(r => !r.ok).length, results }
   }
 
-  async function cleanupOldSessions(days: number) {
+  async function cleanupOldSessions(_days: number) {
     await ready
-    const cutoff = Date.now() - days * 86_400_000
-    const deleted: string[] = []
-    const failed: { sessionId: string; detail: string }[] = []
-    for (const [id] of await ledger.entries()) {
-      try {
-        validateSessionId(id)
-        if (c.agents.get(SessionId(id)) || busySessions().has(id)) continue
-        const row = await describeSession(id)
-        if (row.updatedAt === undefined || Date.parse(row.updatedAt) >= cutoff) continue
-        await deleteSession(id, row.version)
-        deleted.push(id)
-      } catch { failed.push({ sessionId: id, detail: 'Session boundary, activity, or storage validation failed' }) }
-    }
-    return { at: Date.now(), days, deleted: deleted.length, failed }
+    return refusePermanentDelete()
   }
 
   // ---- toolbar mailbox ------------------------------------------------------
@@ -990,9 +925,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       case 'cleanup-now': {
         const days = config.autoCleanupDays.get()
         if (days <= 0) throw new Error('未设置自动清理天数')
-        const summary = await cleanupOldSessions(days)
-        await writeBack({ cleanupStatus: JSON.stringify(summary) })
-        return summary
+        return cleanupOldSessions(days)
       }
       default:
         throw new Error(`未知命令 ${(command as { action?: string }).action}`)
@@ -1022,39 +955,14 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       .catch(error => logger.error(`toolbar reply failed: ${error instanceof Error ? error.stack : String(error)}`))
   }
 
-  let lastCleanupDays = config.autoCleanupDays.get()
-  async function autoCleanup() {
-    const days = config.autoCleanupDays.get()
-    if (days <= 0) return
-    try {
-      const summary = await cleanupOldSessions(days)
-      if (summary.deleted || summary.failed.length) logger.info(`auto cleanup removed ${summary.deleted} MCP session(s)`)
-      await writeBack({ cleanupStatus: JSON.stringify(summary) })
-    } catch (error) {
-      logger.warn(`auto cleanup failed: ${String(error)}`)
-    }
-  }
-
   ctx.on('loader/volatile-update' as any, () => {
-    void handleCommand()
-    const days = config.autoCleanupDays.get()
-    if (days !== lastCleanupDays) {
-      lastCleanupDays = days
-      void autoCleanup()
-    }
+    void handleCommand().catch(() => logger.warn('COMMAND_HANDLER_FAILED'))
   })
-
   ctx.effect(() => {
-    const first = setTimeout(() => { void autoCleanup() }, 30_000)
-    // Fallback in case a volatile-update notification is missed: commands are cheap to re-check.
-    const poll = setInterval(() => { void handleCommand().catch(error => logger.warn(`command poll: ${String(error)}`)) }, 1_000)
-    const every = setInterval(() => { void autoCleanup() }, 6 * 60 * 60 * 1000)
-    return () => {
-      clearTimeout(first)
-      clearInterval(every)
-      clearInterval(poll)
-    }
-  }, 'mcp-bridge: auto cleanup')
+    if (config.autoCleanupDays.get() > 0) logger.warn(PERMANENT_DELETE_MESSAGE)
+    const poll = setInterval(() => { void handleCommand().catch(() => logger.warn('COMMAND_HANDLER_FAILED')) }, 1_000)
+    return () => clearInterval(poll)
+  }, 'mcp-bridge: mailbox poll; automatic deletion disabled')
 
   // The toolbar is this plugin's UI; keep the internal mailbox fields off the auto-generated settings page.
   ctx.effect(() => c.get('settings')?.configure?.({ auto: false }) ?? (() => undefined), 'mcp-bridge: settings page')
@@ -1072,6 +980,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       autoApprove: false,
       legacyAutoApproveIgnored: config.autoApprove.get(),
       approvalMode: snapshot().approvalMode,
+      permanentDeletion: { supported: PERMANENT_DELETE_SUPPORTED, reason: PERMANENT_DELETE_MESSAGE, pendingProcessing: false },
+      automaticCleanupActive: false,
       newSessionPermission: snapshot().newSessionPermission,
       harnessDefaultPermission: c.get('permissionPresets')?.defaultPreset ?? null,
       persistentAuthorizationSupported: false,
@@ -1119,7 +1029,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   function buildServer(): McpServer {
-    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.2' })
+    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.3' })
     server.tool('harness_status', '查看 Harness MCP 桥接状态：开关、模式、锁定模型/供应商、默认工作区、自动批准', {}, async () => {
       try { return text(await status()) } catch (error) { return failure(String(error)) }
     })
@@ -1173,14 +1083,14 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       }
       return taskView(record)
     }))
-    server.tool('delete_session', '永久删除一个会话（不可恢复；需要保留请用 manage_sessions 归档）', {
+    server.tool('delete_session', '该版缺少跨进程安全删除接口；confirm:false 可预览，永久删除执行始终拒绝，请使用归档', {
       sessionId: z.string(),
-      confirm: z.boolean().describe('必须为 true 才会执行'),
+      confirm: z.boolean().describe('false 为只读预览；true 在当前版本返回 PERMANENT_DELETE_UNSUPPORTED'),
     }, ({ sessionId, confirm }) => guarded(async () => {
-      if (!confirm) return { dryRun: true, session: await describeSession(sessionId), hint: '确认后带 confirm: true 再调用' }
+      if (!confirm) return { dryRun: true, session: await describeSession(sessionId), supported: false, hint: PERMANENT_DELETE_MESSAGE }
       return deleteSession(sessionId)
     }))
-    server.tool('manage_sessions', '批量归档 / 取消归档 / 永久删除某工作区的会话；不带 confirm: true 时只预览', {
+    server.tool('manage_sessions', '批量归档 / 取消归档某工作区的会话；不带 confirm:true 时只预览。delete 仅可预览，执行返回 PERMANENT_DELETE_UNSUPPORTED', {
       workspace: z.string().describe('工作区 id、名称或路径'),
       action: z.enum(['archive', 'unarchive', 'delete']),
       mcpOnly: z.boolean().default(true).describe('默认 true，仅 MCP 会话；显式 false 包含个人会话，必须先预览并确认'),

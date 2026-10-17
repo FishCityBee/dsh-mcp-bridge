@@ -1,5 +1,6 @@
 /** Fail-closed filesystem boundary. Never trust ids or persisted absolute paths. */
-import { lstat, readdir, realpath, rm } from 'node:fs/promises'
+import { lstat, readdir, realpath } from 'node:fs/promises'
+import { refusePermanentDelete } from './deletion.ts'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 export function validateSessionId(id: string): void {
@@ -59,17 +60,8 @@ export class SessionFiles {
     return { updatedAt: metadata.mtimeMs, version: `${current[0]!.name}:${metadata.dev}:${metadata.ino}:${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}` }
   }
   async remove(id: string): Promise<void> {
-    // Re-resolve immediately before each destructive call, including the cache path.
-    await this.cache(id)
-    const directory = await this.directory(id)
-    if (directory) {
-      await this.activity(id)
-      const checked = await this.directory(id)
-      if (checked !== directory) throw new Error('SESSION_CHANGED: 存储路径已改变')
-      await rm(directory, { recursive: true, force: false })
-    }
-    const cache = await this.safe(['storages', 'session_projcache', 'sessions', `${id}.json`])
-    if (cache) await rm(cache, { force: false })
+    validateSessionId(id)
+    refusePermanentDelete()
   }
   async cache(id: string): Promise<string | undefined> {
     validateSessionId(id)
