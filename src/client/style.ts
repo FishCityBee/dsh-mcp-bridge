@@ -70,7 +70,41 @@ export const STYLE = `
 .dmb-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .dmb-title { font-weight: 600; font-size: 13px; }
 .dmb-switch, .dmb-check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
-.dmb-switch input, .dmb-check input { accent-color: var(--dsw-alias-brand-primary, #4d6bfe); margin: 0; }
+.dmb-switch input, .dmb-check input {
+  appearance: none;
+  position: relative;
+  width: 30px;
+  height: 18px;
+  flex: none;
+  margin: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--dsw-alias-label-tertiary, #a0a4ab);
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+.dmb-switch input::before, .dmb-check input::before {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  transition: transform 120ms ease;
+}
+.dmb-switch input:checked, .dmb-check input:checked { background: var(--dsw-alias-brand-primary, #4d6bfe); }
+.dmb-switch input:checked::before, .dmb-check input:checked::before { transform: translateX(12px); }
+.dmb-switch input:disabled, .dmb-check input:disabled { opacity: 0.45; cursor: default; }
+.dmb-switch input:focus-visible, .dmb-check input:focus-visible {
+  outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, #4d6bfe);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .dmb-switch input, .dmb-check input, .dmb-switch input::before, .dmb-check input::before { transition: none; }
+}
 .dmb-tabs {
   display: grid;
   grid-template-columns: 1fr 1fr;

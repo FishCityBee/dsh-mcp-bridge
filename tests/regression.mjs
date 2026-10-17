@@ -5,6 +5,53 @@ import {fixture,gate,sleep} from './harness.mjs'
 let failures=0,passed=0
 let caseIndex=0
 const test=async(name,fn,seed)=>{if(++caseIndex>Number(process.env.DMB_REGRESSION_CASE_LIMIT??Infinity))return;let f;try{f=await fixture(seed);await fn(f);passed++;console.log('PASS '+name)}catch(e){failures++;console.error('FAIL '+name+': '+e.message)}finally{await f?.close()}}
+await test('new MCP sessions apply official permission presets including sandbox and approval',async f=>{
+ for(const preset of ['read-only','workspace-write','danger-full-access']){
+  f.values.newSessionPermission=preset
+  const r=await f.call('run_task',{task:'permission preset '+preset})
+  assert.equal(r.body.status,'done');assert.equal(r.body.approval.preset,preset);assert.equal(r.body.approval.sandbox,preset)
+  assert.equal(r.body.approval.mode,preset==='danger-full-access'?'never':'ask');assert.equal(r.body.approval.source,'toolbar-new-session-preset')
+ }
+})
+await test('changing new-session permissions preserves an existing session and human tightening',async f=>{
+ f.values.newSessionPermission='danger-full-access';const first=await f.call('run_task',{task:'new full access'}),id=first.body.sessionId
+ f.ctx.permissionPresets.set(f.live.get(id).session,'read-only')
+ const continued=await f.call('run_task',{task:'continue with human permission',sessionId:id})
+ assert.equal(continued.body.approval.preset,'read-only');assert.equal(continued.body.approval.sandbox,'read-only');assert.equal(continued.body.approval.mode,'ask');assert.equal(continued.body.approval.source,'stored-session')
+})
+await test('cold resume preserves stored permission instead of the new-session default',async f=>{
+ f.values.newSessionPermission='danger-full-access'
+ const r=await f.call('run_task',{task:'resume read only',sessionId:'session-cold-permission'})
+ assert.equal(r.body.status,'done');assert.equal(r.body.approval.preset,'read-only');assert.equal(r.body.approval.mode,'ask')
+},async f=>{
+ await f.sessionFile('session-cold-permission',{mcp:true})
+ f.saved.set('session-cold-permission',{events:[{type:'permission/preset',data:{preset:'read-only'}},{type:'sandbox/mode',data:{mode:'read-only'}},{type:'approval/policy',data:{policy:'ask'}}],messages:[]})
+})
+await test('unavailable permission preset fails before a model request',async f=>{
+ f.values.newSessionPermission='read-only';delete f.ctx.permissionPresets.presets['read-only']
+ const r=await f.call('run_task',{task:'missing preset'});assert.equal(r.body.status,'failed');assert.match(r.body.error,/PERMISSION_PRESET_UNAVAILABLE/);assert.equal(f.requests.length,0)
+})
+await test('permission changes during creation reject stale setup before sending',async f=>{
+ f.values.newSessionPermission='read-only';f.createGate=gate();const t=await f.call('start_task',{task:'permission changed during create'});await sleep(20);f.values.newSessionPermission='danger-full-access';f.createGate.resolve()
+ const r=await f.call('wait_task',{taskId:t.body.taskId});assert.equal(r.body.status,'failed');assert.match(r.body.error,/CONFIG_CONFLICT/);assert.equal(f.requests.length,0)
+})
+await test('Harness future-session default is honored without changing the global default',async f=>{
+ f.defaultPermission='read-only'
+ const inherited=await f.call('run_task',{task:'inherit Harness future-session default'})
+ assert.equal(inherited.body.approval.preset,'read-only');assert.equal(inherited.body.approval.source,'harness-new-session-default')
+ f.values.newSessionPermission='danger-full-access';const explicit=await f.call('run_task',{task:'MCP only explicit full access'})
+ assert.equal(explicit.body.approval.preset,'danger-full-access');assert.equal(f.ctx.permissionPresets.defaultPreset,'read-only')
+})
+await test('explicit new-session preset takes precedence over legacy approval-only configuration',async f=>{
+ f.values.approvalMode='never'
+ const legacy=await f.call('run_task',{task:'legacy deny approvals'});assert.equal(legacy.body.approval.mode,'never');assert.equal(legacy.body.approval.sandbox,'workspace-write')
+ f.values.newSessionPermission='workspace-write'
+ const current=await f.call('run_task',{task:'explicit complete permission preset'});assert.equal(current.body.approval.preset,'workspace-write');assert.equal(current.body.approval.mode,'ask')
+})
+await test('changed Harness default during creation cannot silently start with stale permissions',async f=>{
+ f.createGate=gate();const t=await f.call('start_task',{task:'default changed during create'});await sleep(20);f.defaultPermission='read-only';f.createGate.resolve()
+ const r=await f.call('wait_task',{taskId:t.body.taskId});assert.equal(r.body.status,'failed');assert.match(r.body.error,/CONFIG_CONFLICT/);assert.equal(f.requests.length,0)
+})
 await test('provider defaults are constraints until override is explicitly enabled',async f=>{
  f.values.mode='provider';let r=await f.call('run_task',{task:'no fee',model:'b'});assert.equal(r.error,true);assert.match(String(r.body),/CONFIG_CONFLICT/);assert.equal(f.requests.length,0)
  f.values.providerAllowOverrides=true;r=await f.call('run_task',{task:'explicit',model:'b',reasoningEffort:'high'});assert.equal(r.body.status,'done');assert.deepEqual(f.requests.at(-1).model,'b')

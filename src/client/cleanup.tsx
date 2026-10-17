@@ -106,7 +106,7 @@ export function CleanupSection({ autoCleanupDays, cleanupStatus, defaultWorkspac
               onChange={e => { setOlderThan(e.target.value); setNotice(null) }} />
           </div>
           <label className="dmb-check">
-            <input type="checkbox" checked={mcpOnly} onChange={e => { setMcpOnly(e.target.checked); setNotice(null) }} />
+            <input type="checkbox" role="switch" checked={mcpOnly} onChange={e => { setMcpOnly(e.target.checked); setNotice(null) }} />
             <span>仅 MCP 创建的会话</span>
           </label>
           {notice && <p className="dmb-note">{notice}</p>}

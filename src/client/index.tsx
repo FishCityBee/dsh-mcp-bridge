@@ -16,6 +16,7 @@ import { useEffect, useRef, useState } from 'react'
 import { STYLE } from './style.ts'
 import { CleanupSection, type BatchAction, type BatchFilter } from './cleanup.tsx'
 import { SettingsSync } from './settings-sync.ts'
+import { PERMISSION_PRESETS, type NewSessionPermission } from '../permissions.ts'
 
 const NS = 'mcp-bridge'
 const COMMAND_TIMEOUT_MS = 60_000
@@ -38,6 +39,7 @@ interface Settings {
   defaultWorkspace: string
   autoApprove: boolean
   approvalMode: 'inherit' | 'ask' | 'never'
+  newSessionPermission?: NewSessionPermission
   autoCleanupDays: number
   command: string
   commandResult: string
@@ -48,6 +50,7 @@ type Editable = Omit<Settings, 'command' | 'commandResult' | 'cleanupStatus'>
 
 interface BridgeState {
   catalog: Catalog | null
+  permissions: { defaultPreset: string; options: { value: string }[] } | null
   settings: Settings | null
   error: string | null
   saving: boolean
@@ -101,11 +104,11 @@ function parseJson<T>(raw: string | undefined): T | undefined {
 }
 
 export const name = 'mcp-bridge-toolbar'
-export const inject = ['slots', 'remote', 'remote.session', 'remote.settings']
+export const inject = ['slots', 'remote', 'remote.session', 'remote.settings', 'remote.permissionPresets']
 
 export function apply(ctx: Context): void {
   const c = ctx as any
-  const store = createStore<BridgeState>({ catalog: null, settings: null, error: null, saving: false })
+  const store = createStore<BridgeState>({ catalog: null, permissions: null, settings: null, error: null, saving: false })
   const pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>()
 
   const settleCommands = (settings: Settings) => {
@@ -123,6 +126,16 @@ export function apply(ctx: Context): void {
       store.update({ catalog: unwrap<Catalog>(await c.remote.session.modelCatalog()) })
     } catch (error) {
       store.update({ error: `模型列表加载失败：${message(error)}` })
+    }
+  }
+  let permissionLoad = 0
+  const loadPermissions = async () => {
+    const ticket = ++permissionLoad
+    try {
+      const permissions = unwrap<NonNullable<BridgeState['permissions']>>(await c.remote.permissionPresets.catalog())
+      if (ticket === permissionLoad) store.update({ permissions })
+    } catch (error) {
+      if (ticket === permissionLoad) store.update({ error: `权限预设读取失败：${message(error)}` })
     }
   }
   const sync = new SettingsSync<Settings>({
@@ -172,12 +185,14 @@ export function apply(ctx: Context): void {
   }
 
   void loadCatalog()
+  void loadPermissions()
   void loadSettings()
   for (const event of ['llm/adapters-updated', 'credentials/record-updated', 'credentials/reference-updated']) {
     c.remote.$on(event, () => { void loadCatalog() })
   }
-  c.remote.$on('settings/document-updated', () => { void loadSettings(); void loadCatalog() })
-  ctx.on('connection/reset' as any, () => { void loadCatalog(); void loadSettings() })
+  c.remote.$on('settings/document-updated', () => { void loadSettings(); void loadCatalog(); void loadPermissions() })
+  c.remote.$on('permission-presets/catalog-changed', () => { void loadPermissions() })
+  ctx.on('connection/reset' as any, () => { void loadCatalog(); void loadSettings(); void loadPermissions() })
 
   ctx.effect(() => {
     const tag = document.createElement('style')
@@ -195,7 +210,7 @@ export function apply(ctx: Context): void {
     name: 'shell.overlay',
     id: 'mcp-bridge.toolbar',
     order: 100,
-    inject: () => ({ hooks: { bridge: store }, save, sendCommand, reload: () => { void loadCatalog(); void loadSettings() } }),
+    inject: () => ({ hooks: { bridge: store }, save, sendCommand, reload: () => { void loadCatalog(); void loadSettings(); void loadPermissions() } }),
   }, Toolbar))
 
   c.slots.inject('sidebar.workspaces.session.menu.item', () => c.slots.register({
@@ -246,8 +261,13 @@ function modelLabel(catalog: Catalog | null, provider: string, model: string): s
   return group?.models.find(m => m.id === model)?.name ?? (model || '未选择')
 }
 
+function permissionLabel(preset?: string): string {
+  return ({ 'read-only': '仅可查看', 'workspace-write': '工作区访问', 'danger-full-access': '完全权限' } as Record<string, string>)[preset ?? ''] ?? preset ?? '读取中…'
+}
+
 function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: ToolbarProps) {
   const catalog = useBridge(s => s.catalog)
+  const permissions = useBridge(s => s.permissions)
   const settings = useBridge(s => s.settings)
   const error = useBridge(s => s.error)
   const saving = useBridge(s => s.saving)
@@ -295,7 +315,7 @@ function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: Toolba
           <div className="dmb-row dmb-head">
             <span className="dmb-title">MCP 桥接</span>
             <label className="dmb-switch" title="开启后 Claude Code 可通过 MCP 调用 Harness">
-              <input type="checkbox" checked={enabled} disabled={!settings} onChange={e => void save({ enabled: e.target.checked })} />
+              <input type="checkbox" role="switch" checked={enabled} disabled={!settings} onChange={e => void save({ enabled: e.target.checked })} />
               <span>{enabled ? '已开启' : '已关闭'}</span>
             </label>
           </div>
@@ -364,7 +384,7 @@ function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: Toolba
                 </label>
               )}
               <label className="dmb-check">
-                <input type="checkbox" checked={settings?.providerAllowOverrides ?? false} disabled={!settings}
+                <input type="checkbox" role="switch" checked={settings?.providerAllowOverrides ?? false} disabled={!settings}
                   onChange={e => void save({ providerAllowOverrides: e.target.checked })} />
                 <span>允许调用方选择模型/推理等级</span>
               </label>
@@ -382,16 +402,18 @@ function Toolbar({ useBridge, useWorkspaces, save, sendCommand, reload }: Toolba
           </label>
 
           <label className="dmb-field">
-            <span>MCP 会话审批</span>
-            <select value={settings?.approvalMode ?? 'inherit'} disabled={!settings}
-              onChange={e => void save({ approvalMode: e.target.value as Settings['approvalMode'] })}>
-              <option value="inherit">沿用会话 / Harness 设置</option>
-              <option value="ask">需要审批时询问</option>
-              <option value="never">需要审批时自动拒绝</option>
+            <span>新建 MCP 会话权限</span>
+            <select value={settings?.newSessionPermission ?? 'default'} disabled={!settings || !permissions}
+              onChange={e => void save({ newSessionPermission: e.target.value as NewSessionPermission, approvalMode: 'inherit' })}>
+              <option value="default">Harness 新会话默认（{permissionLabel(permissions?.defaultPreset)}）</option>
+              {PERMISSION_PRESETS.map(preset => <option key={preset} value={preset}
+                disabled={!permissions?.options.some(option => option.value === preset)}>{permissionLabel(preset)}</option>)}
             </select>
           </label>
-          <p className="dmb-note">该版只支持单次允许；允许调用 MCP 不会授予下游文件或命令权限。沙箱与权限范围沿用会话设置。</p>
-          {settings?.autoApprove && <p className="dmb-note">旧“自动批准”设置已停用：它原来实际是拒绝审批。已有会话保留原权限，可明确选择“需要审批时询问”。</p>}
+          <p className="dmb-note">与对话框使用同一权限预设，同时控制沙箱与审批。只影响新建 MCP 会话；续聊和恢复保留会话已有权限。单次允许不会被记为持续授权。</p>
+          {settings?.newSessionPermission === 'danger-full-access' && <p className="dmb-note">完全权限按 Harness 的同名预设执行，允许的文件与命令操作可超出工作区。</p>}
+          {settings?.approvalMode !== 'inherit' && settings?.approvalMode && <p className="dmb-note">旧版独立审批策略仍保留；选择新会话权限后将改用完整权限预设。现有会话不会被改写。</p>}
+          {settings?.autoApprove && <p className="dmb-note">旧“自动批准”配置已停用（原实现实际是拒绝）；请选择新会话权限，现有会话仍保留自己的权限。</p>}
 
           <CleanupSection autoCleanupDays={settings?.autoCleanupDays} cleanupStatus={settings?.cleanupStatus} defaultWorkspace={settings?.defaultWorkspace}
             workspaces={workspaces} saveDays={settings ? days => void save({ autoCleanupDays: days }) : undefined} sendCommand={sendCommand} />

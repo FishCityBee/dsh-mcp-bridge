@@ -5,6 +5,7 @@ import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import {pathToFileURL} from 'node:url'
 import {ApprovalService} from '@deepseek-ai/dsh-user-approval'
+import {PermissionPresetService} from '@deepseek-ai/dsh-permission-presets'
 import {Client} from '@modelcontextprotocol/sdk/client/index.js'
 import {StdioClientTransport} from '@modelcontextprotocol/sdk/client/stdio.js'
 export const sleep=ms=>new Promise(r=>setTimeout(r,ms))
@@ -16,7 +17,7 @@ export async function fixture(seed) {
  process.env.DSH_MCP_BRIDGE_MONITOR_MS='15'
  process.env.DSH_MCP_BRIDGE_PROGRESS_MS='25'
  await writeFile(join(home,'harness-mcp-token.txt'),'offline-fixture-only\n')
- const values={enabled:true,mode:'single',singleProvider:'p',singleModel:'a',singleEffort:'high',providerId:'p',providerDefaultModel:'a',providerDefaultEffort:'low',providerAllowOverrides:false,approvalMode:'inherit',autoApprove:false,defaultWorkspace:'ws',autoCleanupDays:0,command:'',commandResult:'',cleanupStatus:''}
+ const values={enabled:true,mode:'single',singleProvider:'p',singleModel:'a',singleEffort:'high',providerId:'p',providerDefaultModel:'a',providerDefaultEffort:'low',providerAllowOverrides:false,approvalMode:'inherit',newSessionPermission:'default',autoApprove:false,defaultWorkspace:'ws',autoCleanupDays:0,command:'',commandResult:'',cleanupStatus:''}
  const config={pipePath:process.platform==='win32'?`\\\\.\\pipe\\dmb-regression-${process.pid}-${Math.random().toString(36).slice(2)}`:join(home,'bridge.sock'),httpEnabled:false,preset:'',maxConcurrentTasks:2,...Object.fromEntries(Object.keys(values).map(k=>[k,{get:()=>values[k]}]))}
  const handlers=new Map(),disposers=[],requests=[],sent=[],logs=[],live=new Map(),saved=new Map()
  const workspace={id:'ws',title:'Fixture',path:ws,sessionIds:[],async attachSession(id){if(!this.sessionIds.includes(id))this.sessionIds.push(id)},async detachSession(id){this.sessionIds=this.sessionIds.filter(x=>x!==id)}}
@@ -78,6 +79,24 @@ export async function fixture(seed) {
   workspaceRegistry:{list:()=>[workspace],get:()=>workspace,resolveByPath:async()=>workspace,archivedSessionIds:archived,pinnedSessionIds:[],async archiveSession(id){archived.push(id);live.get(id)?.cancel({kind:'user'})},async unarchiveSession(id){const i=archived.indexOf(id);if(i>=0)archived.splice(i,1)},async unpinSession(){}}
  }
  f.ctx=ctx
+ // Use the official preset implementation and canonical event setters. Only
+ // its projection storage is a fixture; no synthetic permission outcome cache.
+ ctx.shell={sandboxMode:'workspace-write'}
+ ctx.sessionProjections={stateOf(session){return session.snapshotEvents().reduce((s,e)=>{
+  if(e.type==='permission/preset')s.preset=e.data.preset
+  if(e.type==='sandbox/mode')s.sandbox=e.data.mode
+  if(e.type==='approval/policy')s.approval=e.data.policy
+  if(e.type==='session/end-seed')s.seeded=true
+  return s
+ },{preset:null,sandbox:null,approval:null,seeded:false})}}
+ const permissionPresets=Object.create(PermissionPresetService.prototype)
+ Object.defineProperty(permissionPresets,'ctx',{value:ctx})
+ permissionPresets.presets=Object.fromEntries(['read-only','workspace-write','danger-full-access'].map(mode=>[mode,{sandbox:mode,approval:mode==='danger-full-access'?'never':'ask'}]))
+ f.defaultPermission='workspace-write'
+ permissionPresets.defaultSettings=()=>({defaultPreset:f.defaultPermission})
+ ctx.permissionPresets=permissionPresets
+ const create=ctx.agents.create
+ ctx.agents.create=async opts=>create({...opts,setup:async(agentCtx,agent)=>{permissionPresets.pinInitialPermission(agent.session);await opts.setup?.(agentCtx,agent)}})
  await seed?.(f)
  const root=new URL('../',import.meta.url)
  const {apply}=await import(process.env.DMB_TEST_HOST_URL??new URL('dist-package/lib/index.js',root))

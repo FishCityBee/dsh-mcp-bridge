@@ -13,6 +13,7 @@ import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
 import { foldConsumedWork, installModelSelection } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
+import { applyNewSessionPermission, type NewSessionPermission } from './permissions.ts'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
@@ -35,7 +36,7 @@ import { SessionFiles, validateSessionId } from './session-files.ts'
 import { JsonWriter, readJson } from './persistence.ts'
 
 export const name = 'mcp-bridge'
-export const inject = ['llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence']
+export const inject = ['llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'permissionPresets']
 
 type Mode = 'single' | 'provider'
 
@@ -59,6 +60,7 @@ export const Config = Schema.object({
   defaultWorkspace: Schema.string().default('').volatile(),
   autoApprove: Schema.boolean().default(false).volatile(),
   approvalMode: Schema.union(['inherit', 'ask', 'never'] as const).default('inherit').volatile(),
+  newSessionPermission: Schema.union(['default', 'read-only', 'workspace-write', 'danger-full-access'] as const).default('default').volatile().description('仅用于新建 MCP 会话；续聊与恢复保留会话已有权限'),
   autoCleanupDays: Schema.number().default(0).volatile(),
   // Toolbar → host mailbox (JSON strings); see handleCommand.
   command: Schema.string().default('').volatile(),
@@ -87,6 +89,7 @@ interface BridgeConfig {
   defaultWorkspace: Ref<string>
   autoApprove: Ref<boolean>
   approvalMode?: Ref<'inherit' | 'ask' | 'never'>
+  newSessionPermission?: Ref<NewSessionPermission>
   autoCleanupDays: Ref<number>
   command: Ref<string>
   commandResult: Ref<string>
@@ -211,6 +214,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       providerId: config.providerId.get(), providerDefaultModel: config.providerDefaultModel.get(), providerDefaultEffort: config.providerDefaultEffort.get(),
       providerAllowOverrides: config.providerAllowOverrides?.get() ?? false,
       approvalMode: config.approvalMode?.get() ?? 'inherit',
+      newSessionPermission: config.newSessionPermission?.get() ?? 'default',
+      harnessDefaultPermission: c.get('permissionPresets')?.defaultPreset,
       defaultWorkspace: config.defaultWorkspace.get(), fallback: defaultSelection(),
     }
   }
@@ -338,7 +343,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
     })
   }
 
-  async function createAgent(args: TaskArgs, selection: Selection, target: { cwd: string; workspace?: WorkspaceLike }, mode: SelectionSettings['approvalMode'], id: string, signal: AbortSignal) {
+  async function createAgent(args: TaskArgs, selection: Selection, target: { cwd: string; workspace?: WorkspaceLike }, permissions: SelectionSettings, id: string, signal: AbortSignal) {
     const { cwd, workspace } = target
     const preset = await presetId()
     const control = routeControl(selection, signal)
@@ -348,7 +353,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       setup: async (agentCtx: Context, agent: any) => {
         await c.agentPresets.mount(agentCtx, preset)
         installRoute(agentCtx, control)
-        applyApproval(agent, mode, true)
+        applyNewSessionPermission(c.get('permissionPresets'), agent.session, permissions.newSessionPermission ?? 'default')
+        applyApproval(agent, permissions.newSessionPermission === 'default' ? permissions.approvalMode : 'inherit', true)
       },
     })
     remember(sessionId, { ...handle, selection: control })
@@ -607,9 +613,10 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       runtime.controller.signal.throwIfAborted()
       delete record.reasoningEffort
       Object.assign(record, resolved.selection, { configVersion: resolved.version })
+      const legacyApproval = resolved.settings.newSessionPermission === 'default' ? resolved.settings.approvalMode : 'inherit'
       const agent = args.sessionId
-        ? await continueAgent(args.sessionId, resolved.selection, resolved.settings.approvalMode, runtime.controller.signal)
-        : await createAgent(args, resolved.selection, target!, resolved.settings.approvalMode, record.sessionId!, runtime.controller.signal)
+        ? await continueAgent(args.sessionId, resolved.selection, legacyApproval, runtime.controller.signal)
+        : await createAgent(args, resolved.selection, target!, resolved.settings, record.sessionId!, runtime.controller.signal)
       runtime.controller.signal.throwIfAborted()
       const reg = registry()
       if (reg.archivedSessionIds.map(String).includes(record.sessionId!)) await reg.unarchiveSession(SessionId(record.sessionId!))
@@ -617,7 +624,9 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       record.cwd = agent.session.header.cwd
       if (target?.workspace) record.workspace = { id: target.workspace.id, title: target.workspace.title, path: target.workspace.path }
       record.approval = {
-        mode: c.get('approval')?.effectivePolicy?.(agent.session) ?? 'unknown', source: resolved.settings.approvalMode === 'inherit' ? 'session-or-harness-default' : 'toolbar-managed-session',
+        mode: c.get('approval')?.effectivePolicy?.(agent.session) ?? 'unknown',
+        source: legacyApproval !== 'inherit' ? 'toolbar-managed-session' : args.sessionId ? 'stored-session'
+          : resolved.settings.newSessionPermission !== 'default' ? 'toolbar-new-session-preset' : 'harness-new-session-default',
         preset: c.get('permissionPresets')?.current?.(agent.session), persistentGrants: false,
         sandbox: [...agent.session.snapshotEvents()].reverse().find((e: any) => e.type === 'sandbox/mode')?.data.mode ?? c.get('shell')?.sandboxMode,
       }
@@ -1063,6 +1072,8 @@ export function apply(ctx: Context, config: BridgeConfig): void {
       autoApprove: false,
       legacyAutoApproveIgnored: config.autoApprove.get(),
       approvalMode: snapshot().approvalMode,
+      newSessionPermission: snapshot().newSessionPermission,
+      harnessDefaultPermission: c.get('permissionPresets')?.defaultPreset ?? null,
       persistentAuthorizationSupported: false,
       providerAllowOverrides: snapshot().providerAllowOverrides,
       configVersion: configVersion(snapshot()), configSource: 'toolbar-v2',
@@ -1108,7 +1119,7 @@ export function apply(ctx: Context, config: BridgeConfig): void {
   }
 
   function buildServer(): McpServer {
-    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.1' })
+    const server = new McpServer({ name: 'dsh-mcp-bridge', version: '0.2.2' })
     server.tool('harness_status', '查看 Harness MCP 桥接状态：开关、模式、锁定模型/供应商、默认工作区、自动批准', {}, async () => {
       try { return text(await status()) } catch (error) { return failure(String(error)) }
     })

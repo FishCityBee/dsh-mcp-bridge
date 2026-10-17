@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { Catalog } from './catalog.ts'
+import type { NewSessionPermission } from './permissions.ts'
 
 export interface Selection { provider: string; model: string; reasoningEffort?: string }
 export interface SelectionSettings {
@@ -13,6 +14,8 @@ export interface SelectionSettings {
   providerDefaultEffort: string
   providerAllowOverrides: boolean
   approvalMode: 'inherit' | 'ask' | 'never'
+  newSessionPermission?: NewSessionPermission
+  harnessDefaultPermission?: string
   defaultWorkspace: string
   fallback?: Selection
 }
