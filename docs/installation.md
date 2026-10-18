@@ -2,7 +2,7 @@
 
 English | [简体中文](installation.zh-CN.md) | [README](../README.md)
 
-These instructions describe bridge **0.2.2**, based on commit `6dca66e1b099d4bcd50860a25c26496ecc770dce`.
+These instructions describe bridge **0.2.4**. See the versioned maintenance notes for the current safety boundaries.
 
 ## Requirements and compatibility
 
@@ -98,7 +98,7 @@ These tools inspect bridge/Harness state; they do not launch an agent task. A su
 
 ## Upgrading
 
-If your installation has queued deletions, read the [known cleanup limitation](troubleshooting.md#cleanup-limitation-and-pending-deletions) before restarting or reloading. Turning automatic cleanup off does not cancel the pending-delete queue.
+If upgrading from 0.2.2, stop the old plugin before loading the fixed build: its pending-delete handler is unsafe. Version 0.2.4 only reads and reports old pending records and never executes or rewrites them. Read the [upgrade boundary](troubleshooting.md#cleanup-limitation-and-pending-deletions).
 
 1. Let active tasks finish, or deliberately cancel them and check their state.
 2. Back up important Harness data and record the working bridge revision.
@@ -106,6 +106,6 @@ If your installation has queued deletions, read the [known cleanup limitation](t
 4. Update, install the locked dependencies, and rebuild. If the bundle path changed, update both the Harness installation and the MCP client path.
 5. Restart Harness, reconnect the client, and repeat the state checks above.
 
-Update the **plugin and the entire relay `bin/` directory together**. Version 0.2.2 uses `tls-pinned-v3`; it does not fall back to the older plaintext or PSK handshakes. Copying only `stdio.mjs` is insufficient because it imports `pipe-tls.mjs`.
+Update the **plugin and the entire relay `bin/` directory together**. Version 0.2.4 uses `tls-pinned-v3`; it does not fall back to the older plaintext or PSK handshakes. Copying only `stdio.mjs` is insufficient because it imports `pipe-tls.mjs`.
 
 See [configuration and permissions](configuration.md) and [troubleshooting](troubleshooting.md) before changing security settings to solve a connection problem.

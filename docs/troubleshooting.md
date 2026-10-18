@@ -6,7 +6,7 @@ English | [简体中文](troubleshooting.zh-CN.md) | [README](../README.md)
 
 Record the bridge revision, Harness version, Node version, operating system, and MCP client/version. Check `harness_status` and the relevant, redacted portion of `$DSH_HOME/mcp-bridge/bridge.log`. Never share the token file or a complete private session archive.
 
-If your installation has pending deletions, read the cleanup warning below **before restarting Harness or the plugin**.
+When upgrading an older installation with pending deletions, read the version-specific maintenance notes below before restarting the old plugin.
 
 ## The client cannot connect
 
@@ -51,13 +51,13 @@ Client timeouts, bridge wait limits, and task cancellation are different. See [l
 
 ## Cleanup limitation and pending deletions
 
-**In 0.2.2, permanent deletion can miss an active writer in another CLI/SDK process sharing `DSH_HOME`.** Keep automatic cleanup at `0`, prefer archiving, and do not use manual permanent deletion until cross-process protection is implemented.
+**0.2.4 refuses all plugin permanent-deletion execution.** Neither `confirm: true`, a preview token, the toolbar, a legacy mailbox command, nor automatic maintenance can bypass this. If permanent deletion is required, inspect and handle it yourself in the official application or tools; those deletion flows have not been verified here. No `rm` workaround is recommended.
 
-Setting `autoCleanupDays: 0` stops automatic age cleanup only. It does **not** cancel `pending-deletes.json`: queued deletions are processed shortly after plugin startup (about five seconds), and the MCP enabled switch does not gate that queue either.
+`autoCleanupDays` now controls automatic archival only; `0` disables it. Old `pending-deletes.json` data is retained byte-for-byte and never executed, cleared, or migrated as completed, regardless of the MCP switch or archival setting. `harness_status.permanentDeletion.pending` reports its count or an explicit unreadable state. Invalid JSON and read errors are not treated as an empty queue.
 
-If you have already queued deletions, do not assume turning off a switch makes a restart safe. Arrange safe handling or use a version with the deletion issue fixed before restarting/reloading the plugin. Keep other writers away from the shared data home. Do not erase queue records merely to hide the warning. Backups and preview tokens do not replace cross-process exclusion.
+These guarantees apply to the fixed plugin, not a still-running 0.2.2 installation. Before upgrading/reloading an older version with queued deletion requests, stop that old plugin and keep a backup. Do not erase its queue just to hide a warning. The fixed version does not repair data already deleted by an older version.
 
-`CONFIRMATION_EXPIRED` and `SESSION_CHANGED` require a fresh preview and user review. They should not be bypassed, even after the separate cross-process issue is fixed.
+Automatic archival preserves logs, cache, ledger, and workspace accounting and uses `stopActivity: false`. It skips local live/busy and uncertain sessions and allows the official activity check to refuse archival. It does not prove cross-process idleness and does not reclaim session-file space.
 
 ## Does Harness have a CLI?
 

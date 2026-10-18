@@ -32,8 +32,8 @@
 | `get_task` | 立即取得任务快照 |
 | `list_tasks` | 找回近期任务；可选 `activeOnly`、`limit` |
 | `cancel_task` | 按 `taskId` 请求取消，并检查后续状态 |
-| `delete_session` | 永久删除一个 `sessionId`；必填 `confirm`，`false` 为预览 |
-| `manage_sessions` | 按明确范围预览、归档、取消归档或删除工作区会话 |
+| `delete_session` | `confirm: false` 只读预览；确认永久删除始终拒绝 |
+| `manage_sessions` | 按明确范围预览、归档、取消归档；确认 `delete` 始终拒绝 |
 
 `run_task` 和 `start_task` 接受 `task`，以及可选的 `workspace`、`sessionId`、`provider`、`model`、`reasoningEffort`、`title`。使用桥接返回的 ID，不要自行编造会话 ID，也不要从文件路径推导它。
 
@@ -49,9 +49,11 @@
 
 等待超时或客户端断线不会提出取消请求。重连后先用 `list_tasks` 找回任务，再决定是否重新提交。Harness 重启后，检查任务是否标为 `interrupted`；桥接不保证每个执行中的操作都能跨进程退出继续存活。
 
-取消不是回滚。已经执行的文件操作、命令或供应商请求可能已经产生效果或费用。任务变为终态后检查结果，再删除会话或判断活动已完全停止。
+取消不是回滚。已经执行的文件操作、命令或供应商请求可能已经产生效果或费用。任务变为终态后检查结果，再管理会话或判断活动已完全停止。
 
 任务状态包括 `queued`、`running`、`waiting_approval`、`done`、`failed`、`cancelled`、`interrupted`。按情况查看 `error`、`termination`、`approval` 和实际结果。`done` 不保证答案正确，也不保证达到你的验收标准。
+
+官方 consumed-work fold 只处理本任务 `eventBaseline` 之后的事件。未运行输入被丢弃时映射为 `cancelled`，即使此前已消费的 turn 已 completed；`termination.droppedUnrun` 和完整 `consumedEnd` 保留这一区别。错误终态仍保留原错误详情及已有结果，桥接主动取消优先。普通 completed／error／blocked／max-tokens／aborted 保持既有映射，缺少有效结算终态时为 interrupted。
 
 ## 继续已有对话
 
@@ -59,17 +61,15 @@
 
 模型约束会针对新任务重新计算。新会话权限选择不会覆盖既有会话的权限。应读取返回的 `effectiveSelection`，而不是仅凭工具栏显示就认定已实际发起对应模型请求。
 
-## 优先归档，再考虑删除
+## 归档与删除边界
 
-> **0.2.2 已知问题：** 桥接的本进程检查无法可靠识别另一个正在向相同数据目录写入的 CLI／SDK 进程，此时永久清理可能删除活跃会话。请保持 `autoCleanupDays: 0`，优先归档，在实现跨进程保护之前不要使用永久删除。以下删除参考仅记录当前接口，不是使用推荐，也不代表清理已经通过完整安全验收。
+**0.2.4 插件内不存在可执行的永久删除路径。** `delete_session` 和 `manage_sessions` 的 `action: "delete"` 保留兼容的只读预览接口；确认执行始终返回 `PERMANENT_DELETE_UNSUPPORTED`。令牌、`confirm: true`、工具栏命令或旧 pending 文件都不能授权删除。拒绝之前不会处置 owner、移除工作区归属或删除 ledger 记录。
 
-已有待删除队列独立存在：即使关闭自动清理或 MCP 开关，插件启动后约五秒仍会处理。已经排队的删除，应先安排安全处理或使用已修复版本，再重启／重载插件。详见[待删除队列警告](troubleshooting.zh-CN.md#清理限制与待删除队列)。
+旧待删除文件只读报告，绝不执行或改写。损坏或无法读取会明确报告，不能当作空队列。若仍运行旧插件，请先阅读[升级说明](troubleshooting.zh-CN.md#清理限制与待删除队列)。
 
-以后可能还要用的对话优先归档。永久删除会移除会话存储及相关投影缓存，不是移入普通可恢复的回收站。
+归档保留会话文件、缓存、ledger 与工作区归属，可通过取消归档恢复。手动 `manage_sessions` 归档保留原有 `stopActivity: true` 行为：拒绝活动中的 MCP 任务后，可能请求停止其他本地可见活动，并取消置顶。自动路径独立实现，始终使用 `stopActivity: false`。
 
-本版本的 `manage_sessions` 使用 `stopActivity: true` 归档：它会请求 Harness 停止该会话的活动，并取消置顶，因此归档不只是隐藏对话。桥接会拒绝归档仍有活动 MCP 任务的会话；归档其他符合条件的会话可能停止其活动。
-
-请备份重要数据。其他 Harness 实例或进程可能写入同一个数据目录时，不要执行清理；进程内的“不忙”检查不保证其他进程没有活动。
+本进程没有 live agent 不证明所有 CLI／SDK 进程均空闲。如需永久删除，请在官方应用或工具中自行检查、手动处理，相关删除流程不在本次验证范围。
 
 ### 批量范围与预览
 
@@ -81,7 +81,7 @@
 - `olderThanDays`：可选，有限且非负的天数过滤值。
 - `includeArchived`：可选；删除默认包含已归档会话，取消归档始终考虑它们。
 - `confirm`：省略或设为 `false` 表示预览。
-- `previewToken`：执行删除，或操作范围包含非 MCP 会话时必填。
+- `previewToken`：操作范围包含非 MCP 会话时必填；其他预览也可使用。令牌不能启用永久删除。
 
 下面只预览归档，不执行变更：
 
@@ -98,15 +98,15 @@
 
 `confirm: true` 是调用方提交的值，不是人已批准的独立证据；调用客户端仍需获得适当用户授权。单会话 `delete_session` 不使用批量预览令牌，应先核对具体会话并用 `confirm: false` 预览。
 
-live 会话的删除可能排队等待 owner 释放；排队回执不意味着所有文件已经移除。发生变化或不受支持的会话可能校验失败，需要重新审阅。
+不再产生新的待删除记录。旧请求保持原样，包括无效或历史格式条目。所有永久删除执行在处置 owner 或消耗预览令牌之前就拒绝。
 
-### 自动清理
+### 自动归档
 
-`autoCleanupDays` 默认 **0（关闭）**。上方跨进程问题解决前，应保持关闭。设为正数会自动永久删除符合条件的 MCP 会话，不再逐个询问确认；它会在启动后、约每六小时以及修改保留天数时运行。
+兼容配置键 `autoCleanupDays` 默认 **0（关闭）**。正数表示仅自动归档旧 MCP 会话。插件启动 30 秒后运行，此后约每六小时一次；工具栏“立即自动归档”使用相同实现。修改天数在下一轮或立即操作时生效。MCP 启用开关不控制这个独立维护选项。
 
-年龄过滤使用可识别的当前最高代会话日志文件的修改时间，不使用会话目录修改时间。这是存储时间戳，不能普遍等同于“最近没有任何有用工作”。桥接通过本进程检查排除 live／busy 会话；无法确认或有歧义的活动时间不足以支持自动过期删除。
+年龄依据可识别的当前最高代日志文件活动时间，不使用目录 mtime。已归档、本进程 live／busy、近期活动、未知／歧义活动或版本变化会跳过；身份、路径或官方活动检查失败会报告。异步读取后再次检查，向官方接口明确传入 `stopActivity: false`，由其拒绝已报告的活动，不请求停止任务。这不证明跨进程均空闲。
 
-这些操作面向已核对的 `$DSH_HOME/sessions` JSONL 存储根；不要使用自定义根。路径与身份检查降低风险，但不会使永久删除可恢复，也不证明与所有外部进程充分隔离。
+结果包含 `kind: "auto-archive"`、`schemaVersion: 1`、`archived`、`skipped`、`failed`；兼容字段 `deleted` 始终为 **0**。工具栏区分旧清理记录与新归档回执。归档保留日志、缓存、ledger 和工作区归属，可取消归档恢复，不释放会话文件占用的磁盘空间。仅支持已核对的 `$DSH_HOME/sessions` JSONL 根；自定义或大小写不同的其他根会拒绝。
 
 ## 本地数据与保留策略
 
@@ -118,11 +118,11 @@ live 会话的删除可能排队等待 owner 释放；排队回执不意味着�
 | `$DSH_HOME/mcp-bridge/bridge.log` | 桥接诊断日志 |
 | `$DSH_HOME/mcp-bridge/tasks.json` | 活动任务与保留的终态历史，包括任务／结果元数据 |
 | `$DSH_HOME/mcp-bridge/sessions.json` | MCP 创建会话的台账 |
-| `$DSH_HOME/mcp-bridge/pending-deletes.json` | 待删除 ID 及日志版本 |
+| `$DSH_HOME/mcp-bridge/pending-deletes.json` | 历史删除请求：原样保留，只读诊断 |
 | `$DSH_HOME/mcp-bridge/endpoint.json` | 已发布的本地端点信息 |
 | `$DSH_HOME/sessions/` | Harness 会话存储，独立于桥接任务索引 |
 | `$DSH_HOME/storages/session_projcache/sessions/` | 本版本使用的 Harness 会话投影缓存 |
 
-任务索引保留全部活动记录，以及最近七天内最多 200 条终态记录。任务记录过期与删除 Harness 会话是两件事。写入失败时查看 `storageError`、`durability`、`persistenceError`；任务恢复依赖成功存储的状态。
+任务索引保留全部活动记录，以及最近七天内最多 200 条终态记录。任务记录过期与删除 Harness 会话是两件事。写入失败时查看 `storageError`、`durability`、`persistenceError`；任务恢复依赖成功存储的状态。磁盘快照标记为 `durable`，内存记录只在匹配的写成功回执到达后才标为 durable；新写入与进度变化会作废旧回执，当前写失败会显示 degraded。冷加载只描述已保存的快照，不代表上次进程未落盘的后续进度。
 
 把整个数据目录当作私密内容保护。任务记录可能包含提示词片段、路径、输出、工具参数和审批细节。删除一个会话，不会自动抹去已经发送到 MCP 客户端、模型供应商、备份或其他日志中的副本。
