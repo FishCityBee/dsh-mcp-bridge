@@ -32,8 +32,8 @@ This launches model work and can incur provider charges. Omitted model/provider/
 | `get_task` | Retrieve an immediate task snapshot |
 | `list_tasks` | Find recent tasks; optional `activeOnly` and `limit` |
 | `cancel_task` | Request cancellation by `taskId`; check the resulting state |
-| `delete_session` | Permanently delete one `sessionId`; `confirm` is required, and `false` previews |
-| `manage_sessions` | Preview/archive/unarchive/delete workspace sessions with explicit scope filters |
+| `delete_session` | Read-only preview with `confirm: false`; confirmed permanent deletion is unsupported |
+| `manage_sessions` | Preview/archive/unarchive workspace sessions; confirmed `delete` always refuses |
 
 `run_task` and `start_task` accept `task` plus optional `workspace`, `sessionId`, `provider`, `model`, `reasoningEffort`, and `title`. Use IDs returned by the bridge; never invent a session ID or derive one from a filesystem path.
 
@@ -49,9 +49,11 @@ For clients with short call limits:
 
 A wait timeout or lost client connection does not request cancellation. Reconnect and use `list_tasks` to find the task before submitting duplicate work. On a Harness restart, inspect whether a task is `interrupted`; the bridge does not promise that every in-flight operation survives a process exit.
 
-Cancellation is not rollback. Files, commands, or provider requests already performed may have effects or charges. Wait until the task is terminal and inspect the result before deleting its session or assuming all activity has stopped.
+Cancellation is not rollback. Files, commands, or provider requests already performed may have effects or charges. Wait until the task is terminal and inspect the result before managing its session or assuming all activity has stopped.
 
 Task statuses are `queued`, `running`, `waiting_approval`, `done`, `failed`, `cancelled`, and `interrupted`. Review `error`, `termination`, `approval`, and the actual result as applicable. `done` is not a guarantee that the answer is correct or meets your acceptance criteria.
+
+The official consumed-work fold is applied only to this task's `eventBaseline` suffix. A dropped unrun input maps to `cancelled`, including when an earlier consumed turn completed; `termination.droppedUnrun` and the full `consumedEnd` preserve that distinction. An error ending retains its error details and any result. Bridge-requested cancellation takes priority. Ordinary completed/error/blocked/max-tokens/aborted endings retain their mappings; an unaccounted ending is interrupted.
 
 ## Continuing a conversation
 
@@ -59,17 +61,15 @@ Supply the previously returned `sessionId` in a new task request. The bridge can
 
 Model constraints are evaluated for the new task. New-session permission choices do not overwrite the existing session's permissions. Read the returned `effectiveSelection` instead of assuming that a toolbar display alone proves a model request occurred.
 
-## Archive before deleting
+## Archive and deletion boundaries
 
-> **Known issue in 0.2.2:** the bridge's local checks cannot reliably detect another CLI/SDK process writing to the same data home. Permanent cleanup can remove an active session in that situation. Keep `autoCleanupDays: 0`, use archiving, and do not use permanent deletion until cross-process protection is implemented. The deletion reference below documents the current interface; it is not a recommendation to use it or a claim that cleanup has passed complete safety validation.
+**0.2.4 has no executable permanent-deletion path in the plugin.** `delete_session` and `manage_sessions` with `action: "delete"` remain compatible read-only preview interfaces; every confirmed execution returns `PERMANENT_DELETE_UNSUPPORTED`. Tokens, `confirm: true`, toolbar commands, and pending files cannot authorize deletion. No owner is disposed, workspace membership removed, or ledger entry deleted before refusal.
 
-Existing pending deletions are separate: they are still processed about five seconds after plugin startup, even with automatic cleanup off or the MCP switch disabled. If you have queued deletions, arrange safe handling or a fixed version before restarting/reloading the plugin. See the [pending-deletion warning](troubleshooting.md#cleanup-limitation-and-pending-deletions).
+Old pending-delete files are only read and reported, never executed or rewritten. A malformed or unreadable file is reported explicitly rather than treated as an empty queue. See [upgrade notes](troubleshooting.md#cleanup-limitation-and-pending-deletions) if an older plugin is still running.
 
-Archiving is the preferred option when you might want a conversation again. Permanent deletion removes session storage and associated projection cache; it is not a move to an ordinary recoverable trash folder.
+Archive keeps session files, cache, ledger, and workspace membership and can be reversed by unarchive. Manual `manage_sessions` archive retains its existing `stopActivity: true` behavior: after refusing active MCP tasks, it can request that other locally reported activity stop and drops the pin. The automatic path is separate and always uses `stopActivity: false`.
 
-In this version, `manage_sessions` archives with `stopActivity: true`: it requests that Harness stop the session's activity and removes its pin. Archiving is therefore not just hiding a conversation. The bridge rejects sessions with active MCP tasks; archiving other eligible sessions can stop their activity.
-
-Back up important data. Avoid cleanup while another Harness instance or process may be writing to the same data home. Do not treat in-process “not busy” checks as a guarantee about other processes.
+An absence of local live agents does not prove every CLI/SDK process is idle. For permanent deletion, inspect and handle the session yourself in the official application or tools; their deletion flows have not been verified here.
 
 ### Batch scope and preview
 
@@ -81,7 +81,7 @@ Back up important data. Avoid cleanup while another Harness instance or process 
 - `olderThanDays`: optional, finite nonnegative age filter.
 - `includeArchived`: optional; deletion includes archived sessions by default, and unarchive always considers them.
 - `confirm`: omit or set `false` to preview.
-- `previewToken`: required to execute deletion or any batch that includes non-MCP sessions.
+- `previewToken`: required for a batch that includes non-MCP sessions; available for other previews. It cannot enable permanent deletion.
 
 A non-destructive archive preview example:
 
@@ -98,15 +98,15 @@ Read the exact target IDs before deciding. For an approved execution, submit the
 
 `confirm: true` is a caller-supplied value, not independent evidence that a person approved. The calling client must obtain the appropriate user authorization. The single-session `delete_session` flow does not use a batch preview token; review the specific session and use `confirm: false` first.
 
-A live session's removal may be queued until its owner releases it. A queued response does not mean all files have been removed. Changed or unsupported sessions can fail validation and require a fresh review.
+No new pending-delete records are created. Old pending requests stay untouched, including invalid or legacy entries. All permanent-delete execution refuses before acting on an owner or consuming a preview token.
 
-### Automatic cleanup
+### Automatic archival
 
-`autoCleanupDays` defaults to **0 (off)**. Keep it off while the cross-process issue above remains. Setting a positive age enables permanent deletion of eligible MCP-created sessions without a new per-session confirmation. It runs after startup, periodically (about every six hours), and when the age setting changes.
+The compatibility key `autoCleanupDays` defaults to **0 (off)**. A positive number enables archival of old MCP-created sessions only. Startup runs after 30 seconds; later passes run about every six hours. The toolbar's immediate-archive button uses the same routine. Changed days take effect on the next pass or immediate action. The MCP enabled switch does not control this separate maintenance setting.
 
-Age filtering uses the modification time of the recognized current highest-generation session log, not the session directory's modification time. This is a storage timestamp, not a general semantic guarantee of “no useful recent work.” Live/busy sessions are excluded by the bridge's local checks. Unknown or ambiguous activity cannot justify automatic expiry.
+The current recognized highest-generation log supplies the activity timestamp; directory mtime is ignored. Already archived, locally live/busy, recent, unknown/ambiguous, or changed sessions are skipped; failed identity/path/activity checks are reported. Checks repeat after asynchronous reads, and the official call receives `stopActivity: false`. The official registry may refuse reported activity; no stop is requested. This is not a cross-process idleness proof.
 
-These operations are intended for the checked JSONL storage root `$DSH_HOME/sessions`; do not use custom roots. Path and identity checks reduce risk; they do not make permanent cleanup reversible or establish isolation from every external process.
+Results contain `kind: "auto-archive"`, `schemaVersion: 1`, `archived`, `skipped`, and `failed`; compatibility `deleted` is always **0**. The toolbar distinguishes old cleanup records from these receipts. Archive retains logs, cache, ledger, and workspace membership, supports unarchive, and does not reclaim session-file disk space. The checked JSONL root is `$DSH_HOME/sessions`; custom or case-distinct roots are refused.
 
 ## Local data and retention
 
@@ -118,11 +118,11 @@ These operations are intended for the checked JSONL storage root `$DSH_HOME/sess
 | `$DSH_HOME/mcp-bridge/bridge.log` | Bridge diagnostic log |
 | `$DSH_HOME/mcp-bridge/tasks.json` | Active tasks and retained terminal history, including task/result metadata |
 | `$DSH_HOME/mcp-bridge/sessions.json` | Ledger of MCP-created sessions |
-| `$DSH_HOME/mcp-bridge/pending-deletes.json` | Pending deletion IDs and log versions |
+| `$DSH_HOME/mcp-bridge/pending-deletes.json` | Legacy deletion requests: retained unchanged, read-only diagnostics |
 | `$DSH_HOME/mcp-bridge/endpoint.json` | Published local endpoint information |
 | `$DSH_HOME/sessions/` | Harness session storage, separate from the bridge's task index |
 | `$DSH_HOME/storages/session_projcache/sessions/` | Harness session projection cache used by this version |
 
-The task index retains all active records plus at most 200 terminal records from the last seven days. Expiring a task record is separate from deleting a Harness session. Check `storageError`, `durability`, and `persistenceError` if writes fail; task recovery depends on successfully stored state.
+The task index retains all active records plus at most 200 terminal records from the last seven days. Expiring a task record is separate from deleting a Harness session. Check `storageError`, `durability`, and `persistenceError` if writes fail; task recovery depends on successfully stored state. At-rest snapshots record `durable`; live records become durable only on a matching successful write receipt. New writes and progress mutations invalidate older receipts, and current write failures report degraded state. Cold load describes the saved snapshot, not unpersisted progress from a prior process.
 
 Treat the entire data directory as private. Task records can contain prompt excerpts, paths, outputs, tool arguments, and approval details. Deleting a session does not by itself erase copies already sent to an MCP client, a model provider, backups, or other logs.

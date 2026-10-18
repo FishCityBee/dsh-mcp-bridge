@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url'
 const root = fileURLToPath(new URL('.', import.meta.url))
 const out = `${root}dist-package/`
 const PACKAGE = 'dsh-mcp-bridge'
-const VERSION = '0.2.2'
+const VERSION = '0.2.4'
 
 // Shell-shared browser modules (dsh-client-web platform.ts); everything else is inlined.
 const PLATFORM_MODULES = [

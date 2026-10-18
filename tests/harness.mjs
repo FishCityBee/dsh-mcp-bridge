@@ -24,7 +24,7 @@ export async function fixture(seed) {
  const archived=[]
  const register=(table,name,fn,options)=>{const list=table.get(name)??[];options?.prepend?list.unshift(fn):list.push(fn);table.set(name,list);return ()=>{const i=list.indexOf(fn);if(i>=0)list.splice(i,1)}}
  const waterfall=(table,name,payload,terminal)=>{const list=table.get(name)??[];const run=i=>list[i]?(name==='system-prompt/assemble'?list[i](payload,{},()=>run(i+1)):list[i](payload,()=>run(i+1))):terminal();return run(0)}
- const f={home,ws,values,config,requests,sent,logs,live,saved,workspace,archived,createGate:null,resumeGate:null,answer:'allowed-once',asked:0}
+ const f={home,ws,values,config,requests,sent,logs,live,saved,workspace,archived,archiveCalls:[],archiveRefusals:new Set(),createGate:null,resumeGate:null,answer:'allowed-once',asked:0}
  const approval=Object.create(ApprovalService.prototype)
  Object.defineProperty(approval,'ctx',{value:{waterfall(_target,_name,_req,next){f.asked++;return typeof f.answer==='function'?f.answer(_req,next):Promise.resolve(f.answer)}}})
  approval.config={policy:'ask'}
@@ -76,7 +76,7 @@ export async function fixture(seed) {
   agentDefaultModel:{currentSelection:()=>({provider:'p',model:'a'})},agentPresets:{resolve:async()=>({id:'standard'}),mount:async()=>{}},
   sessionPersistence:{root:join(home,'sessions'),async stat(id){try{const file=fileFor(id),s=await stat(file),header=JSON.parse((await readFile(file,'utf8')).split('\n')[0]).data;if(header.id!==id)return undefined;return {header,revision:`${s.size}:${s.mtimeMs}`}}catch(e){if(e.code==='ENOENT')return undefined;throw e}}},
   agents:{get:id=>live.get(id),async create(opts){if(f.createGate)await f.createGate.promise;const agent=f.agent(opts.sessionId,opts.agentOptions);await opts.setup?.(agent.ctx,agent);await f.sessionFile(opts.sessionId);live.set(opts.sessionId,agent);return {agent,async dispose(){agent.cancel({kind:'disposed'});await agent.whenIdle();live.delete(opts.sessionId)}}},async resume(opts){if(f.resumeGate)await f.resumeGate.promise;const stored=saved.get(opts.resumeSessionId)??{};const agent=f.agent(opts.resumeSessionId,opts.agentOptions,stored.events,stored.messages);await opts.setup?.(agent.ctx,agent);live.set(opts.resumeSessionId,agent);return {agent,async dispose(){agent.cancel({kind:'disposed'});await agent.whenIdle();live.delete(opts.resumeSessionId)}}}},
-  workspaceRegistry:{list:()=>[workspace],get:()=>workspace,resolveByPath:async()=>workspace,archivedSessionIds:archived,pinnedSessionIds:[],async archiveSession(id){archived.push(id);live.get(id)?.cancel({kind:'user'})},async unarchiveSession(id){const i=archived.indexOf(id);if(i>=0)archived.splice(i,1)},async unpinSession(){}}
+  workspaceRegistry:{list:()=>[workspace],get:()=>workspace,resolveByPath:async()=>workspace,archivedSessionIds:archived,pinnedSessionIds:[],async archiveSession(id,options={}){f.archiveCalls.push({id,options});if(f.archiveRefusals.has(id))throw new Error('WORKSPACE_ACTIVE_SESSION');if(!archived.includes(id))archived.push(id);if(options.stopActivity===true)live.get(id)?.cancel({kind:'user'})},async unarchiveSession(id){const i=archived.indexOf(id);if(i>=0)archived.splice(i,1)},async unpinSession(){}}
  }
  f.ctx=ctx
  // Use the official preset implementation and canonical event setters. Only
@@ -100,7 +100,12 @@ export async function fixture(seed) {
  await seed?.(f)
  const root=new URL('../',import.meta.url)
  const {apply}=await import(process.env.DMB_TEST_HOST_URL??new URL('dist-package/lib/index.js',root))
- apply(ctx,config);await sleep(60)
+ // Capture only the maintenance interval for deterministic periodic-entry tests.
+ // All timers still use the real clock; tests may invoke the captured callback.
+ const nativeInterval=globalThis.setInterval
+ globalThis.setInterval=(fn,ms,...args)=>{if(ms===6*60*60*1000)f.runScheduledArchive=fn;return nativeInterval(fn,ms,...args)}
+ try{apply(ctx,config)}finally{globalThis.setInterval=nativeInterval}
+ await sleep(60)
  const client=new Client({name:'offline-regression',version:'0'})
  await client.connect(new StdioClientTransport({command:process.execPath,args:[process.env.DMB_TEST_RELAY??new URL('dist-package/bin/stdio.mjs',root).pathname.replace(/^\/(\w:)/,'$1')].map(decodeURIComponent),env:{...process.env,DSH_HOME:home,DSH_MCP_BRIDGE_PIPE:config.pipePath}}))
  f.client=client

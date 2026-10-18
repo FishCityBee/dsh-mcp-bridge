@@ -2,7 +2,7 @@
 
 [English](configuration.md) | 简体中文 | [README](../README.zh-CN.md)
 
-本文描述桥接插件 0.2.2。用 `harness_status` 检查当前配置和存储状态，用 `list_models` 查看当前允许调用方选择的模型。
+本文描述桥接插件 0.2.4。用 `harness_status` 检查当前配置和存储状态，用 `list_models` 查看当前允许调用方选择的模型。
 
 ## 模型选择
 
@@ -72,6 +72,14 @@
 - `autoApprove` 已被忽略，不作为授权来源。
 - `approvalMode`（`inherit`、`ask`、`never`）保留后端兼容，显式 `ask`／`never` 也可用于受管理会话的续聊和恢复。新 UI 明确选择新会话预设时会把它重置为 `inherit`，让完整预设同时控制沙箱和审批。
 - `providerAllowOverrides` 默认 `false`，旧配置缺失该字段时也是如此。这是相对于最初供应商模式的有意行为调整。
+
+## 自动归档
+
+为兼容升级，保留配置键 `autoCleanupDays`，但含义改为**自动归档**：`0` 关闭，正数表示处理当前有效日志早于该天数的 MCP 会话。插件启动 30 秒后和约每六小时运行一次；工具栏“立即自动归档”使用同一实现。修改天数后在下一轮或立即操作时生效，独立于 MCP 启用开关。
+
+自动归档跳过已归档、本进程 live／busy、近期活动、活动未知、版本变化及边界验证失败的会话。调用官方接口时传入 `stopActivity: false`，保留文件与 MCP ledger，可取消归档恢复。这不证明其他进程均空闲，也不释放会话文件占用的磁盘空间。`harness_status.automaticArchive` 显示配置和最近结果；兼容字段 `automaticCleanupActive` 现在表示仅归档维护。
+
+`cleanupStatus` 使用带版本的 `kind: "auto-archive"` 回执，包含 `archived`、`skipped`、`failed`；兼容字段 `deleted` 始终为 `0`。历史或格式异常的清理记录不会显示为新的归档结果。`harness_status.permanentDeletion.pending` 只读报告保留数量或无法读取状态，不修改旧文件。
 
 ## 连接与环境变量
 

@@ -2,7 +2,7 @@
 
 English | [简体中文](configuration.zh-CN.md) | [README](../README.md)
 
-This page describes bridge 0.2.2. Use `harness_status` to inspect current configuration and storage health, and `list_models` to see the choices currently permitted to the caller.
+This page describes bridge 0.2.4. Use `harness_status` to inspect current configuration and storage health, and `list_models` to see the choices currently permitted to the caller.
 
 ## Model selection
 
@@ -72,6 +72,14 @@ An `approval/asked` event is evidence of an approval request, not proof that a p
 - `autoApprove` is ignored and is not an authorization source.
 - `approvalMode` (`inherit`, `ask`, `never`) remains for backend compatibility. Explicit `ask`/`never` can apply to managed continuations and restoration as well. The new UI resets it to `inherit` when an explicit new-session preset is chosen, so the full preset controls both sandbox and approval policy.
 - `providerAllowOverrides` defaults to `false`, including when missing in old configuration. This is an intentional change from the original provider-mode behavior.
+
+## Automatic archival
+
+`autoCleanupDays` keeps its legacy name for compatibility. Its value now means **automatic archival only**: `0` disables it, a positive number selects MCP-created sessions whose recognized current log is older than that many days. It runs 30 seconds after plugin startup and about every six hours; the toolbar's immediate-archive button uses the same implementation. Changes take effect on the next pass or immediate action. It is independent of the MCP enabled switch.
+
+Automatic archival skips already archived, live/busy, recent, unknown-activity, changed, and invalid-boundary sessions. It passes `stopActivity: false` to the official registry, preserves files and the MCP ledger, and can be undone with unarchive. This does not establish that every external process is idle or reclaim session-file disk space. `harness_status.automaticArchive` reports configuration and the latest result; the compatibility field `automaticCleanupActive` now refers to archive-only maintenance.
+
+`cleanupStatus` now stores a versioned `kind: "auto-archive"` receipt with `archived`, `skipped`, and `failed`; `deleted` is always `0` for compatibility. Historical or malformed cleanup records are not displayed as new archive results. `harness_status.permanentDeletion.pending` reports retained pending counts or an unreadable state without modifying the old file.
 
 ## Transport and environment
 

@@ -12,7 +12,7 @@ Once a private channel is established, include the affected bridge commit, Harne
 
 ## Security boundaries
 
-Bridge 0.2.2 has a known cross-process deletion limitation: another CLI/SDK writer sharing the data home may not be detected. Keep automatic cleanup off and do not use permanent deletion until this is fixed. Existing pending deletions can still execute after startup, even with automatic cleanup and MCP disabled. Read the [cleanup and restart warning](docs/troubleshooting.md#cleanup-limitation-and-pending-deletions).
+Bridge 0.2.4 fails closed for all plugin permanent-deletion execution: the pinned official storage API has no verified safe cross-process deletion boundary. Automatic maintenance only archives with `stopActivity: false`; old pending-delete files are only read and reported, never executed or rewritten. This does not prove external writers are idle. See the [maintenance and upgrade boundary](docs/troubleshooting.md#cleanup-limitation-and-pending-deletions).
 
 - This is a third-party integration, not an official DeepSeek, Anthropic, or OpenAI product.
 - Connecting an MCP client grants it access to the bridge's exposed tools. An authenticated connection is not proof of human approval for each operation.
@@ -38,7 +38,7 @@ See the user guide for the exact behavior and data locations of the revision you
 
 ### 安全边界
 
-桥接 0.2.2 存在已知跨进程删除限制：可能无法识别共享数据目录的其他 CLI／SDK 写入者。修复前应关闭自动清理，并停用永久删除。即使关闭自动清理和 MCP，已有待删除队列仍可能在启动后执行。请阅读[清理与重启警告](docs/troubleshooting.zh-CN.md#清理限制与待删除队列)。
+桥接 0.2.4 对插件内所有永久删除执行均保守拒绝：固定版本的官方存储 API 未提供已验证的跨进程安全删除边界。自动维护仅使用 `stopActivity: false` 归档；旧待删除文件只读报告，绝不执行或改写。这不证明外部写入者空闲。详见[维护与升级边界](docs/troubleshooting.zh-CN.md#清理限制与待删除队列)。
 
 - 这是第三方集成，并非 DeepSeek、Anthropic 或 OpenAI 官方产品。
 - 接入 MCP 客户端意味着它可以访问桥接公开的工具。连接通过认证，不等于每次操作都已经得到人的批准。

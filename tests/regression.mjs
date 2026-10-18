@@ -96,9 +96,9 @@ await test('junction and projection-cache escape are refused',async f=>{
 })
 await test('default batch scope is MCP only and confirmation binds IDs',async f=>{
  await f.call('run_task',{task:'create managed'});await f.sessionFile('session-personal')
- const p=await f.call('manage_sessions',{workspace:'ws',action:'delete'});assert.equal(p.body.count,1);assert.ok(p.body.previewToken)
+ const p=await f.call('manage_sessions',{workspace:'ws',action:'archive'});assert.equal(p.body.count,1);assert.ok(p.body.previewToken)
  await f.call('run_task',{task:'created after preview'})
- const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true,previewToken:p.body.previewToken});assert.equal(r.body.done,1);assert.ok(f.workspace.sessionIds.includes('session-personal'));assert.equal(f.workspace.sessionIds.length,2)
+ const r=await f.call('manage_sessions',{workspace:'ws',action:'archive',confirm:true,previewToken:p.body.previewToken});assert.equal(r.body.done,1);assert.ok(f.workspace.sessionIds.includes('session-personal'));assert.equal(f.workspace.sessionIds.length,3);assert.equal(f.archived.length,1);assert.ok(!f.archived.includes('session-personal'))
 })
 await test('old directory with freshly appended log is not expired',async f=>{
  const t=await f.call('run_task',{task:'create active history'}),id=t.body.sessionId;await f.live.get(id).whenIdle();f.live.delete(id)
@@ -137,16 +137,17 @@ await test('real approval decisions repeat once grants and distinguish expanded 
  f.values.approvalMode='never';const r=await f.call('run_task',{task:'approval denied',sessionId:id});assert.equal(f.asked,3);assert.equal(r.body.approvalDiagnostics.at(-1).outcome,'rejected');assert.equal(r.body.approval.persistentGrants,false)
  f.values.approvalMode='ask';await f.call('run_task',{task:'approval ask again',sessionId:id});assert.equal(f.asked,4)
 })
-await test('changed session version invalidates a delete confirmation',async f=>{
- const t=await f.call('run_task',{task:'initial'});const p=await f.call('manage_sessions',{workspace:'ws',action:'delete'});await f.call('run_task',{task:'changed',sessionId:t.body.sessionId});const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true,previewToken:p.body.previewToken});assert.equal(r.error,true);assert.match(r.body,/SESSION_CHANGED/);assert.ok(f.workspace.sessionIds.includes(t.body.sessionId))
+await test('changed session version invalidates an executable archive confirmation',async f=>{
+ const t=await f.call('run_task',{task:'initial'});const p=await f.call('manage_sessions',{workspace:'ws',action:'archive'});await f.call('run_task',{task:'changed',sessionId:t.body.sessionId});const r=await f.call('manage_sessions',{workspace:'ws',action:'archive',confirm:true,previewToken:p.body.previewToken});assert.equal(r.error,true);assert.match(r.body,/SESSION_CHANGED/);assert.ok(f.workspace.sessionIds.includes(t.body.sessionId))
 })
-await test('batch delete without a preview token is refused',async f=>{
- await f.call('run_task',{task:'initial'});const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true});assert.equal(r.error,true);assert.match(r.body,/CONFIRMATION_REQUIRED/)
+await test('batch deletion always refuses and personal archival still requires a preview token',async f=>{
+ await f.call('run_task',{task:'initial'});const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true});assert.equal(r.error,true);assert.match(r.body,/PERMANENT_DELETE_UNSUPPORTED/);const personal=await f.call('manage_sessions',{workspace:'ws',action:'archive',mcpOnly:false,confirm:true});assert.equal(personal.error,true);assert.match(personal.body,/CONFIRMATION_REQUIRED/)
 })
-await test('owner flush after preview cannot add unconfirmed data to deletion',async f=>{
+await test('unsupported deletion never disposes a writer or triggers its final flush',async f=>{
  const original=f.ctx.agents.create.bind(f.ctx.agents)
- f.ctx.agents.create=async options=>{const handle=await original(options),dispose=handle.dispose;handle.dispose=async()=>{await dispose();await appendFile(join(f.home,'sessions','fixture',options.sessionId,'session.v4.jsonl'),'{}\n')};return handle}
- const t=await f.call('run_task',{task:'fixture owner flush'}),id=t.body.sessionId,p=await f.call('manage_sessions',{workspace:'ws',action:'delete'});const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true,previewToken:p.body.previewToken});assert.equal(r.body.done,0);assert.equal(r.body.failed,1);assert.match(r.body.results[0].detail,/SESSION_CHANGED/);assert.ok(await stat(join(f.home,'sessions','fixture',id,'session.v4.jsonl')))
+ let disposed=0
+ f.ctx.agents.create=async options=>{const handle=await original(options),dispose=handle.dispose;handle.dispose=async()=>{disposed++;await dispose();await appendFile(join(f.home,'sessions','fixture',options.sessionId,'session.v4.jsonl'),'{}\n')};return handle}
+ const t=await f.call('run_task',{task:'fixture owner flush'}),id=t.body.sessionId,p=await f.call('manage_sessions',{workspace:'ws',action:'delete'});const r=await f.call('manage_sessions',{workspace:'ws',action:'delete',confirm:true,previewToken:p.body.previewToken});assert.equal(r.error,true);assert.match(r.body,/PERMANENT_DELETE_UNSUPPORTED/);assert.equal(disposed,0);assert.ok(f.live.has(id));assert.ok(await stat(join(f.home,'sessions','fixture',id,'session.v4.jsonl')))
 })
 await test('projection cache junction is checked before removing session files',async f=>{
  const id='session-cache',file=await f.sessionFile(id),outside=join(f.home,'outside-cache');await mkdir(outside);await writeFile(join(outside,id+'.json'),'keep');await mkdir(join(f.home,'storages','session_projcache'),{recursive:true});await symlink(outside,join(f.home,'storages','session_projcache','sessions'),process.platform==='win32'?'junction':'dir');const r=await f.call('delete_session',{sessionId:id,confirm:true});assert.equal(r.error,true);assert.ok(await stat(file));assert.equal(await readFile(join(outside,id+'.json'),'utf8'),'keep')
@@ -155,7 +156,7 @@ await test('directory existence and workspace membership do not prove a real ses
  const id='session-fake',dir=join(f.home,'sessions','fixture',id);await mkdir(dir,{recursive:true});await writeFile(join(dir,'marker'),'keep');f.workspace.sessionIds.push(id);const r=await f.call('delete_session',{sessionId:id,confirm:true});assert.equal(r.error,true);assert.equal(await readFile(join(dir,'marker'),'utf8'),'keep')
 })
 await test('a different backend root cannot authorize deleting a same-ID local directory',async f=>{
- const id='session-other-root',file=await f.sessionFile(id);f.ctx.sessionPersistence.root=join(f.home,'other-sessions');const r=await f.call('delete_session',{sessionId:id,confirm:true});assert.equal(r.error,true);assert.match(r.body,/UNSUPPORTED_SESSION_STORAGE/);assert.ok(await stat(file))
+ const id='session-other-root',file=await f.sessionFile(id);f.ctx.sessionPersistence.root=join(f.home,'other-sessions');const r=await f.call('delete_session',{sessionId:id,confirm:true});assert.equal(r.error,true);assert.match(r.body,/PERMANENT_DELETE_UNSUPPORTED/);const preview=await f.call('delete_session',{sessionId:id,confirm:false});assert.equal(preview.error,true);assert.match(preview.body,/UNSUPPORTED_SESSION_STORAGE/);assert.ok(await stat(file))
 })
 await test('task acceptance failure starts no agent and is explicit',async f=>{
  const path=join(f.home,'mcp-bridge','tasks.json');await rm(path);await mkdir(path);try{const r=await f.call('start_task',{task:'must-not-start'});assert.equal(r.error,true);assert.match(r.body,/STORAGE_WRITE_FAILED/);assert.equal(f.sent.length,0);assert.equal(f.live.size,0)}finally{await rm(path,{recursive:true});await writeFile(path,'[]')}
@@ -168,13 +169,14 @@ await test('recovery reconstructs a pending approval and reserves the concurrenc
  const id='session-recovered';await f.sessionFile(id,{mcp:true});const agent=f.agent(id,{provider:'p',model:'a',reasoningEffort:'high'});f.live.set(id,agent);agent.followup({content:[{type:'text',text:'approval slow:100'}]});await sleep(10)
  await writeFile(join(f.home,'mcp-bridge','tasks.json'),JSON.stringify([{id:'task-recovered',sessionId:id,status:'waiting_approval',createdAt:Date.now(),provider:'p',model:'a',reasoningEffort:'high',task:'fixture recovery',baseline:0,eventBaseline:0,progress:{steps:0,toolCalls:0,lastActivityAt:Date.now()}}]))
 })
-await test('automatic cleanup uses the same fresh-log activity rule as batch filtering',async f=>{
+await test('automatic archive distinguishes fresh and old current logs without deleting either',async f=>{
  const a=await f.call('run_task',{task:'old directory, fresh log'}),b=await f.call('run_task',{task:'genuinely old log'})
  for(let i=0;i<9;i++)await f.call('run_task',{task:'evict '+i})
  const old=new Date(Date.now()-20*86400000),dir=id=>join(f.home,'sessions','fixture',id),file=id=>join(dir(id),'session.v4.jsonl')
  await utimes(dir(a.body.sessionId),old,old);await appendFile(file(a.body.sessionId),'{}\n');await utimes(file(b.body.sessionId),old,old);await utimes(dir(b.body.sessionId),old,old)
- await f.ctx.settings.update('mcp-bridge',{autoCleanupDays:7});for(let i=0;i<100&&!f.values.cleanupStatus;i++)await sleep(10)
- const result=JSON.parse(f.values.cleanupStatus);assert.equal(result.deleted,1);assert.ok(await stat(file(a.body.sessionId)));await assert.rejects(stat(file(b.body.sessionId)),{code:'ENOENT'})
+ await f.ctx.settings.update('mcp-bridge',{autoCleanupDays:7,command:JSON.stringify({id:'disabled-cleanup',at:Date.now(),action:'cleanup-now'})});for(let i=0;i<100&&!f.values.commandResult;i++)await sleep(10)
+ const result=JSON.parse(f.values.commandResult);assert.equal(result.ok,true);assert.equal(result.result.archived,1);assert.equal(result.result.deleted,0);assert.ok(!f.archived.includes(a.body.sessionId));assert.ok(f.archived.includes(b.body.sessionId));assert.ok(await stat(file(a.body.sessionId)));assert.ok(await stat(file(b.body.sessionId)))
+ const preview=await f.call('manage_sessions',{workspace:'ws',action:'delete',olderThanDays:7});assert.deepEqual(preview.body.targets.map(t=>t.sessionId),[b.body.sessionId])
 })
 await test('a terminal persistence failure is reported without falsifying the task result',async f=>{
  const t=await f.call('start_task',{task:'slow:120'});for(let i=0;i<100&&!f.requests.length;i++)await sleep(5)
@@ -182,7 +184,7 @@ await test('a terminal persistence failure is reported without falsifying the ta
  try{const r=await f.call('wait_task',{taskId:t.body.taskId});assert.equal(r.body.status,'done');assert.equal(r.body.durability,'degraded');assert.equal(r.body.persistenceError,'STORAGE_WRITE_FAILED')}finally{await rm(path,{recursive:true});await writeFile(path,'[]')}
 })
 await test('tampered and legacy pending-delete paths never remove an outside marker',async f=>{
- await sleep(5200);assert.equal(await readFile(join(f.home,'outside-pending','marker'),'utf8'),'keep');assert.ok(f.logs.some(l=>l.includes('pending delete refused')))
+ await sleep(5200);assert.equal(await readFile(join(f.home,'outside-pending','marker'),'utf8'),'keep');assert.ok(f.logs.some(l=>l.includes('pending records retained; no deletion attempted')))
 },async f=>{
  const outside=join(f.home,'outside-pending');await mkdir(outside);await writeFile(join(outside,'marker'),'keep');await mkdir(join(f.home,'mcp-bridge'),{recursive:true});await writeFile(join(f.home,'mcp-bridge','pending-deletes.json'),JSON.stringify([{id:'../../outside-pending',directory:outside},{id:'session-legacy',directory:outside,version:'forged'}]))
 })

@@ -26,7 +26,7 @@ await test('ledger concurrent first load does not lose records',async()=>{
  const path=join(root,'ledger.json'),s=new SessionLedger(path);await Promise.all(Array.from({length:30},(_,i)=>s.add('s'+i,{createdAt:i,title:'fixture'})));assert.equal((await s.entries()).length,30);assert.equal(Object.keys(JSON.parse(await readFile(path,'utf8'))).length,30)
 })
 await test('ledger write failures and malformed reads fail closed',async()=>{
- const path=join(root,'ledger-blocked.json');await mkdir(path);const s=new SessionLedger(join(path,'..','blocked-parent','ledger.json'));await writeFile(join(root,'blocked-parent'),'block');await assert.rejects(s.add('x',{createdAt:1,title:'fixture'}),/STORAGE_WRITE_FAILED/);await writeFile(join(root,'malformed.json'),'{');await assert.rejects(new SessionLedger(join(root,'malformed.json')).entries(),/STORAGE_READ_FAILED/)
+ const path=join(root,'ledger-blocked.json');await mkdir(path);const s=new SessionLedger(join(path,'..','blocked-parent','ledger.json'));await s.entries();await writeFile(join(root,'blocked-parent'),'block');await assert.rejects(s.add('x',{createdAt:1,title:'fixture'}),/STORAGE_WRITE_FAILED/);assert.equal(await s.get('x'),undefined);await writeFile(join(root,'malformed.json'),'{');await assert.rejects(new SessionLedger(join(root,'malformed.json')).entries(),/STORAGE_READ_FAILED/)
 })
 await test('stale settings load cannot overwrite a newer load',async()=>{
  const a=gate(),b=gate();let n=0,visible;const s=new SettingsSync({read:()=>++n===1?a.promise:b.promise,write:async()=>{},publish:v=>visible=v});const first=s.load(),second=s.load();b.resolve({model:'b'});await second;a.resolve({model:'a'});await first;assert.equal(visible.model,'b')
